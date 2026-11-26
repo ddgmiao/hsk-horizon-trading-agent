@@ -1,10 +1,13 @@
-import { Contract, ContractFactory, JsonRpcProvider, Wallet, formatUnits, getAddress, id, keccak256, parseUnits, toUtf8Bytes } from "ethers";
-import { readFile } from "node:fs/promises";
+import { Contract, ContractFactory, JsonRpcProvider, formatUnits, getAddress, parseUnits } from "ethers";
+import { resolve } from "node:path";
 import { loadConfig, type AgentConfig } from "./config.js";
 import { DECISION_LOG_ABI, ERC20_ABI, FACTORY_ABI, POOL_ABI, QUOTER_V2_ABI, ROUTER_ABI, WHSK_ABI } from "./abi.js";
+import { reconcilePendingSwap, refreshBootstrapBaseline } from "./settlement.js";
+import { withAgentLock } from "./locking.js";
+import { ReserveError, submitWithReserve } from "./transactions.js";
 import { compileDecisionLog } from "./compile.js";
-import { appendJsonLine, loadState, saveState, utcDay, type AgentState } from "./persistence.js";
-import { assertTestnet, createRuntime, loadDecisionLogAddress, persistDeployment, type Runtime } from "./runtime.js";
+import { appendJsonLine, loadState, restoreLedgerCooldown, saveState, utcDay, type AgentState } from "./persistence.js";
+import { assertTestnet, createRuntime, loadAuditDeployment, loadDecisionLogAddress, persistDeployment, type Runtime } from "./runtime.js";
 import { ABSOLUTE_MAX_SLIPPAGE_BPS, evaluateRisk, ONE, planRebalance, priceX18FromSqrtPrice, type Plan, type RiskCheck } from "./strategy.js";
 
 type Snapshot = {
@@ -25,23 +28,21 @@ type SwapOutcome = {
   registryTxHash: string | null;
   decisionLogAddress?: string;
   approvalTxHash: string | null;
-  amountIn: bigint;
-  amountOut: bigint;
+  amountIn: bigint | null;
+  amountOut: bigint | null;
   quoteOut: bigint;
   minOut: bigint;
   error?: string;
 };
 
-const BOOTSTRAP_ACTION_CODE = 3;
-const BUY_ACTION_CODE = 1;
-const SELL_ACTION_CODE = 2;
+export type DecisionRecord = ReturnType<typeof makeDecisionRecord>;
 
 export async function preflight(): Promise<Record<string, unknown>> {
   const config = loadConfig();
   const runtime = await createRuntime(config);
   const setup = await verifySetup(runtime);
   const snapshot = await readSnapshot(runtime);
-  const state = await loadState(config.statePath);
+  const state = await loadRiskState(runtime);
   const plan = planRebalance(snapshot, config);
   const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now()));
   const quoteAmount = parseUnits("0.01", 18);
@@ -107,10 +108,15 @@ export async function preflight(): Promise<Record<string, unknown>> {
 export async function observe(): Promise<Record<string, unknown>> {
   const config = loadConfig();
   const runtime = await createRuntime(config);
+  return withAgentLock(config.statePath, () => observeLocked(runtime));
+}
+
+async function observeLocked(runtime: Runtime): Promise<Record<string, unknown>> {
+  const {config} = runtime;
   await verifySetup(runtime);
   const snapshot = await readSnapshot(runtime);
-  const state = await loadState(config.statePath);
-  if (state.dailyStartValueQuote === null && snapshot.valueQuote > 0n) {
+  const state = await loadRiskState(runtime);
+  if (!state.pendingSwap && !state.bootstrapBaselinePending && state.dailyStartValueQuote === null && snapshot.valueQuote > 0n) {
     state.utcDay = utcDay(Date.now());
     state.dailyStartValueQuote = snapshot.valueQuote.toString();
     await saveState(config.statePath, state);
@@ -157,26 +163,31 @@ export async function deployDecisionLog(): Promise<Record<string, unknown>> {
 export async function bootstrapOnce(): Promise<Record<string, unknown>> {
   const config = loadConfig();
   const runtime = await createRuntime(config);
-  const setup = await verifySetup(runtime);
-  const state = await loadState(config.statePath);
-  const snapshot = await readSnapshot(runtime);
-  return bootstrap(runtime, setup.bootstrapPool, snapshot, state);
+  return withAgentLock(config.statePath, async () => {
+    await assertTestnet(runtime.provider, config.chainId);
+    const state = await loadRiskState(runtime);
+    const recovered = await reconcilePendingSwap(runtime, state);
+    if (recovered) return recovered;
+    await refreshBootstrapBaseline(runtime, state);
+    if (state.bootstrapBaselinePending) throw new Error("Awaiting positive bootstrap baseline; refusing to trade");
+    const setup = await verifySetup(runtime);
+    const snapshot = await readSnapshot(runtime);
+    return bootstrap(runtime, setup.bootstrapPool, snapshot, state);
+  });
 }
 
-export async function runAgent(maxCycles = loadConfig().maxCycles): Promise<void> {
-  const config = loadConfig();
-  const runtime = await createRuntime(config);
-  const setup = await verifySetup(runtime);
-  const registryAddress = await requireDecisionLog(runtime);
-  console.log(JSON.stringify({status: "agent_started", chainId: 133, wallet: runtime.walletAddress, decisionLog: registryAddress, maxCycles}));
+export async function runAgent(maxCycles = loadConfig().maxCycles, suppliedRuntime?: Runtime): Promise<void> {
+  const runtime = suppliedRuntime ?? await createRuntime(loadConfig());
+  const {config} = runtime;
+  console.log(JSON.stringify({status: "agent_started", chainId: 133, wallet: runtime.walletAddress, maxCycles}));
   let cycle = 0;
   while (maxCycles === 0 || cycle < maxCycles) {
     cycle++;
     try {
-      await runCycle(runtime, setup.bootstrapPool);
+      await runCycle(runtime);
     } catch (error) {
       const record = {timestamp: new Date().toISOString(), cycle, status: "cycle_error", error: errorMessage(error)};
-      await appendJsonLine(config.logPath, record);
+      await withAgentLock(config.statePath, () => appendJsonLine(config.logPath, record));
       console.error(JSON.stringify(record));
     }
     if (maxCycles !== 0 && cycle >= maxCycles) break;
@@ -189,27 +200,21 @@ export async function auditDecisionLog(): Promise<Record<string, unknown>> {
   const config = loadConfig();
   const provider = new JsonRpcProvider(config.rpcUrl, config.chainId, {staticNetwork: true});
   await assertTestnet(provider, config.chainId);
-  const address = await loadDecisionLogAddress();
+  const {address, fromBlock, agent} = await loadAuditDeployment();
   if (await provider.getCode(address) === "0x") throw new Error("Configured DecisionLog has no testnet code");
   const latest = await provider.getBlockNumber();
+  if (fromBlock > latest) throw new Error(`RPC head ${latest} precedes deployment block ${fromBlock}`);
   const contract = new Contract(address, DECISION_LOG_ABI, provider);
-  let fromBlock = Math.max(0, latest - 1000);
-  try {
-    const deployment = JSON.parse(await readFile(".runtime/deployment.json", "utf8")) as {decisionLog?: string; deployedAtBlock?: number};
-    if (deployment.decisionLog?.toLowerCase() === address.toLowerCase() && Number.isSafeInteger(deployment.deployedAtBlock)) {
-      fromBlock = deployment.deployedAtBlock!;
-    }
-  } catch {
-    // An address supplied outside this workspace falls back to a recent bounded audit window.
-  }
   const events: Awaited<ReturnType<typeof contract.queryFilter>> = [];
-  const filter = contract.filters.DecisionLogged!(null, null);
+  const filter = contract.filters.DecisionLogged!(null, agent);
   for (let start = fromBlock; start <= latest; start += 1000) {
     events.push(...await contract.queryFilter(filter, start, Math.min(latest, start + 999)));
   }
   return {
     chainId: 133,
     decisionLog: address,
+    agent,
+    fromBlock,
     latestBlock: latest,
     eventCount: events.length,
     events: events.map((event) => ({
@@ -241,24 +246,40 @@ export async function discoverCandidates(): Promise<Record<string, unknown>> {
   return {chainId: 133, pair: [config.token0, config.token1], factoryResults};
 }
 
-async function runCycle(runtime: Runtime, bootstrapPool: string): Promise<void> {
-  const {config, walletAddress} = runtime;
+const activeCycles = new Map<string, Promise<void>>();
+
+export function runCycle(runtime: Runtime, bootstrapPool?: string): Promise<void> {
+  const key = resolve(runtime.config.statePath);
+  const active = activeCycles.get(key);
+  if (active) return active;
+  const cycle = withAgentLock(key, () => runCycleLocked(runtime, bootstrapPool)).finally(() => activeCycles.delete(key));
+  activeCycles.set(key, cycle);
+  return cycle;
+}
+
+async function loadRiskState(runtime: Runtime): Promise<AgentState> {
+  const state = await loadState(runtime.config.statePath, runtime.walletAddress);
+  await restoreLedgerCooldown(runtime.config.logPath, state);
+  return state;
+}
+
+async function runCycleLocked(runtime: Runtime, bootstrapPool?: string): Promise<void> {
+  const {config} = runtime;
   await assertTestnet(runtime.provider, config.chainId);
+  const state = await loadRiskState(runtime);
+  if (await reconcilePendingSwap(runtime, state)) return;
+  await refreshBootstrapBaseline(runtime, state);
+  if (state.bootstrapBaselinePending) throw new Error("Awaiting positive bootstrap baseline; refusing to trade");
+  const setupPool = bootstrapPool ?? (await verifySetup(runtime)).bootstrapPool;
   const snapshot = await readSnapshot(runtime);
   const balancesEmpty = snapshot.balance0 === 0n && snapshot.balance1 === 0n;
-  let state = await loadState(config.statePath);
 
   if (!state.bootstrapComplete && balancesEmpty) {
-    await bootstrap(runtime, bootstrapPool, snapshot, state);
+    await bootstrap(runtime, setupPool, snapshot, state);
     return;
   }
   if (!state.bootstrapComplete && !balancesEmpty) {
     state.bootstrapComplete = true;
-  }
-  const day = utcDay(Date.now());
-  if (state.utcDay !== day) {
-    state.utcDay = day;
-    state.dailyStartValueQuote = null;
   }
   if (state.dailyStartValueQuote === null && snapshot.valueQuote > 0n) {
     state.dailyStartValueQuote = snapshot.valueQuote.toString();
@@ -281,32 +302,13 @@ async function runCycle(runtime: Runtime, bootstrapPool: string): Promise<void> 
     });
     await appendJsonLine(config.logPath, record);
     console.log(JSON.stringify({timestamp: record.timestamp, status, action: plan.action, reason: plan.reason}));
-    await saveState(config.statePath, state);
     return;
   }
 
   const tokenIn = plan.tokenInIndex === 0 ? config.token0 : config.token1;
   const tokenOut = plan.tokenInIndex === 0 ? config.token1 : config.token0;
-  const outcome = await executeSwap(runtime, {
-    snapshot,
-    tokenIn,
-    tokenOut,
-    fee: config.poolFee,
-    amountIn: plan.amountIn,
-    plan,
-    riskChecks,
-    actionCode: plan.action === "BUY_TOKEN1" ? BUY_ACTION_CODE : SELL_ACTION_CODE,
-    reason: plan.reason,
-  });
-  if (outcome.swapTxHash) {
-    state.lastTradeAtMs = Date.now();
-    const after = await readSnapshot(runtime);
-    if (after.valueQuote > 0n && state.dailyStartValueQuote === null) state.dailyStartValueQuote = after.valueQuote.toString();
-  }
-  await saveState(config.statePath, state);
-  const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, outcome);
-  await appendJsonLine(config.logPath, record);
-  console.log(JSON.stringify({timestamp: record.timestamp, status: outcome.status, action: plan.action, txHash: outcome.swapTxHash, reason: plan.reason}));
+  const record = await executeSwap(runtime, state, {snapshot, tokenIn, tokenOut, plan, riskChecks});
+  console.log(JSON.stringify({timestamp: record.timestamp, status: record.execution.status, action: plan.action, txHash: record.execution.swapTxHash, reason: plan.reason}));
 }
 
 async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapshot, state: AgentState): Promise<Record<string, unknown>> {
@@ -372,8 +374,14 @@ async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapsh
     if (native < needed + config.hskGasReserve) {
       return recordBootstrapHold(runtime, snapshot, state, "Insufficient HSK for the configured WHSK seed plus the native gas reserve.", riskChecks);
     }
-    await assertTestnet(runtime.provider, config.chainId);
-    const wrapTx = await whsk.deposit({value: needed});
+    const request = await whsk.deposit.populateTransaction({value: needed});
+    let wrapTx;
+    try {
+      wrapTx = await submitWithReserve(runtime, request);
+    } catch (error) {
+      if (error instanceof ReserveError) return recordBootstrapHold(runtime, snapshot, state, error.message, riskChecks);
+      throw error;
+    }
     const wrapReceipt = await wrapTx.wait();
     if (!wrapReceipt || wrapReceipt.status !== 1) throw new Error("WHSK deposit transaction failed");
     await appendJsonLine(config.logPath, {
@@ -390,30 +398,11 @@ async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapsh
   const bootstrapPool = new Contract(poolAddress, POOL_ABI, runtime.provider);
   const bootstrapSlot = await bootstrapPool.slot0();
   const priceX96 = BigInt(bootstrapSlot[0]);
-  const outcome = await executeSwap(runtime, {
-    snapshot,
-    tokenIn: config.whsk,
-    tokenOut: config.bootstrapToken,
-    fee: config.poolFee,
-    amountIn,
-    plan,
-    riskChecks,
-    actionCode: BOOTSTRAP_ACTION_CODE,
-    reason: plan.reason,
-    priceX96,
-    expectedPool: poolAddress,
+  const record = await executeSwap(runtime, state, {
+    snapshot, tokenIn: config.whsk, tokenOut: config.bootstrapToken, plan, riskChecks,
+    bootstrapPool: poolAddress, priceX96,
   });
-  if (outcome.swapTxHash) {
-    state.lastTradeAtMs = Date.now();
-    state.bootstrapComplete = true;
-    const after = await readSnapshot(runtime);
-    state.dailyStartValueQuote = after.valueQuote > 0n ? after.valueQuote.toString() : null;
-    state.utcDay = utcDay(Date.now());
-  }
-  await saveState(config.statePath, state);
-  const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, outcome, "BOOTSTRAP", priceX96);
-  await appendJsonLine(config.logPath, record);
-  console.log(JSON.stringify({timestamp: record.timestamp, status: outcome.status, action: "BOOTSTRAP", txHash: outcome.swapTxHash}));
+  console.log(JSON.stringify({timestamp: record.timestamp, status: record.execution.status, action: "BOOTSTRAP", txHash: record.execution.swapTxHash}));
   return record;
 }
 
@@ -438,117 +427,78 @@ async function recordBootstrapHold(runtime: Runtime, snapshot: Snapshot, state: 
   return record;
 }
 
-async function executeSwap(runtime: Runtime, input: {
+async function executeSwap(runtime: Runtime, state: AgentState, input: {
   snapshot: Snapshot;
   tokenIn: string;
   tokenOut: string;
-  fee: number;
-  amountIn: bigint;
   plan: Plan;
   riskChecks: RiskCheck[];
-  actionCode: number;
-  reason: string;
   priceX96?: bigint;
-  expectedPool?: string;
-}): Promise<SwapOutcome> {
+  bootstrapPool?: string;
+}): Promise<DecisionRecord> {
   const {config, provider, wallet, walletAddress} = runtime;
+  const {plan, riskChecks, snapshot} = input;
+  const {amountIn} = plan;
   const registryAddress = await requireDecisionLog(runtime);
-  const registry = new Contract(registryAddress, DECISION_LOG_ABI, provider);
-  const [inputCode, outputCode, routerCode, registryCode] = await Promise.all([
-    provider.getCode(input.tokenIn), provider.getCode(input.tokenOut), provider.getCode(config.router), provider.getCode(registryAddress),
-  ]);
-  if ([inputCode, outputCode, routerCode, registryCode].some((code) => code === "0x")) throw new Error("Swap preflight found a configured address without testnet contract code");
-  if (input.expectedPool) {
-    const pool = await new Contract(config.factory, FACTORY_ABI, provider).getPool(input.tokenIn, input.tokenOut, input.fee) as string;
-    if (getAddress(pool) !== getAddress(input.expectedPool)) throw new Error("Bootstrap pool does not match the configured testnet factory result");
+  const codes = await Promise.all([input.tokenIn, input.tokenOut, config.router].map(address => provider.getCode(address)));
+  if (codes.some(code => code === "0x")) throw new Error("Swap preflight found a configured address without testnet contract code");
+  if (input.bootstrapPool) {
+    const pool = await new Contract(config.factory, FACTORY_ABI, provider).getPool(input.tokenIn, input.tokenOut, config.poolFee) as string;
+    if (getAddress(pool) !== getAddress(input.bootstrapPool)) throw new Error("Bootstrap pool does not match the configured testnet factory result");
   }
-  const quoteOut = await quoteExactInput(runtime, input.tokenIn, input.tokenOut, input.amountIn, input.fee);
+
+  const quoteOut = await quoteExactInput(runtime, input.tokenIn, input.tokenOut, amountIn, config.poolFee);
   if (quoteOut <= 0n) throw new Error("Quoter returned zero output; refusing to swap");
   const minOut = (quoteOut * BigInt(10000 - config.maxSlippageBps)) / 10000n;
-  const tokenIn = new Contract(input.tokenIn, ERC20_ABI, wallet);
-  const tokenOut = new Contract(input.tokenOut, ERC20_ABI, provider);
-  const beforeInput = BigInt(await tokenIn.balanceOf(walletAddress));
-  const beforeOutput = BigInt(await tokenOut.balanceOf(walletAddress));
-  if (beforeInput < input.amountIn) throw new Error("Insufficient token input balance for planned trade");
+  const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, {
+    status: "swap_submitted", swapTxHash: null, registryTxHash: null, decisionLogAddress: registryAddress,
+    approvalTxHash: null, amountIn: 0n, amountOut: 0n, quoteOut, minOut,
+  }, input.bootstrapPool ? "BOOTSTRAP" : "REBALANCE", input.priceX96);
 
-  let approvalTxHash: string | null = null;
-  const allowance = BigInt(await new Contract(input.tokenIn, ERC20_ABI, provider).allowance(walletAddress, config.router));
-  if (allowance < input.amountIn) {
-    await assertTestnet(provider, config.chainId);
-    const approval = await tokenIn.approve(config.router, input.amountIn);
-    const approvalReceipt = await approval.wait();
-    if (!approvalReceipt || approvalReceipt.status !== 1) throw new Error("Exact token approval failed");
-    approvalTxHash = approval.hash;
+  async function blocked(reason: string) {
+    record.execution.status = input.bootstrapPool ? "bootstrap_blocked" : "risk_blocked";
+    record.execution.error = reason;
+    await appendJsonLine(config.logPath, record);
+    return record;
   }
 
-  await assertTestnet(provider, config.chainId);
+  if (input.bootstrapPool && quoteOut > config.maxPositionQuote) {
+    const detail = `Bootstrap execution quote ${quoteOut} exceeds the TT1 position cap ${config.maxPositionQuote}`;
+    record.constraints = riskChecks.map(check => check.name === "max_position_size" ? {...check, passed: false, detail} : check);
+    return blocked(detail);
+  }
+  const token = new Contract(input.tokenIn, ERC20_ABI, wallet);
+  const balance = BigInt(await token.balanceOf(walletAddress));
+  if (balance < amountIn) throw new Error("Insufficient token input balance for planned trade");
+
+  const allowance = BigInt(await token.allowance(walletAddress, config.router));
   const router = new Contract(config.router, ROUTER_ABI, wallet);
-  const tx = await router.exactInputSingle({
-    tokenIn: input.tokenIn,
-    tokenOut: input.tokenOut,
-    fee: input.fee,
-    recipient: walletAddress,
-    amountIn: input.amountIn,
-    amountOutMinimum: minOut,
-    sqrtPriceLimitX96: 0,
+  const request = await router.exactInputSingle.populateTransaction({
+    tokenIn: input.tokenIn, tokenOut: input.tokenOut, fee: config.poolFee,
+    recipient: walletAddress, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0,
   });
-  const receipt = await tx.wait();
-  if (!receipt || receipt.status !== 1) throw new Error("SwapRouter02 transaction failed");
-  const afterInput = BigInt(await tokenIn.balanceOf(walletAddress));
-  const afterOutput = BigInt(await tokenOut.balanceOf(walletAddress));
-  const actualInput = beforeInput - afterInput;
-  const actualOutput = afterOutput - beforeOutput;
-  // The swap is already settled on-chain at this point. A bounds violation
-  // must not throw the settled trade away: record it (including the on-chain
-  // decision log below) and surface the violation in the outcome instead.
-  const boundsError = actualInput <= 0n || actualOutput < minOut
-    ? `Swap ${tx.hash} settled outside the signed amount bounds (actualInput=${actualInput}, actualOutput=${actualOutput}, minOut=${minOut})`
-    : undefined;
-
-  let registryTxHash: string | null = null;
-  let registryError: string | undefined;
+  let swap;
   try {
-    await assertTestnet(provider, config.chainId);
-    const boundRegistry = registry.connect(wallet) as Contract;
-    const timestamp = Math.floor(Date.now() / 1000);
-    const priceX96 = input.priceX96 ?? input.snapshot.sqrtPriceX96;
-    const decisionId = id(`${walletAddress}:${tx.hash}:${timestamp}`);
-    const reasonHash = keccak256(toUtf8Bytes(input.reason));
-    const deviation = BigInt(input.plan.deviationBps);
-    const logTx = await boundRegistry.record(
-      decisionId,
-      timestamp,
-      deviation,
-      input.actionCode,
-      priceX96,
-      actualInput,
-      actualOutput,
-      tx.hash,
-      reasonHash,
-    );
-    const logReceipt = await logTx.wait();
-    if (!logReceipt || logReceipt.status !== 1) throw new Error("DecisionLog transaction failed");
-    registryTxHash = logTx.hash;
+    if (allowance < amountIn) {
+      const approval = await submitWithReserve(runtime, await token.approve.populateTransaction(config.router, amountIn));
+      const receipt = await approval.wait();
+      if (!receipt || receipt.status !== 1) throw new Error("Exact token approval failed");
+      record.execution.approvalTxHash = approval.hash;
+    }
+    swap = await submitWithReserve(runtime, request, async hash => {
+      record.execution.swapTxHash = hash;
+      state.pendingSwap = {tokenIn: getAddress(input.tokenIn), tokenOut: getAddress(input.tokenOut),
+        pool: getAddress(input.bootstrapPool ?? config.pool), record};
+      await saveState(config.statePath, state);
+    });
   } catch (error) {
-    registryError = errorMessage(error);
+    if (error instanceof ReserveError) return blocked(error.message);
+    throw error;
   }
-
-  const errors = [
-    ...(boundsError ? [boundsError] : []),
-    ...(registryError ? [`Swap succeeded but on-chain decision logging failed: ${registryError}`] : []),
-  ];
-  return {
-    status: boundsError ? "swap_success_bounds_violation" : registryError ? "swap_success_registry_failed" : "success",
-    swapTxHash: tx.hash,
-    registryTxHash,
-    decisionLogAddress: registryAddress,
-    approvalTxHash,
-    amountIn: actualInput,
-    amountOut: actualOutput,
-    quoteOut,
-    minOut,
-    ...(errors.length ? {error: errors.join("; ")} : {}),
-  };
+  const receipt = await provider.waitForTransaction(swap.hash, 1);
+  if (!receipt) throw new Error(`Awaiting swap receipt ${swap.hash}`);
+  await reconcilePendingSwap(runtime, state, receipt);
+  return record;
 }
 
 async function verifySetup(runtime: Runtime): Promise<{bootstrapPool: string}> {
@@ -670,8 +620,8 @@ function makeDecisionRecord(runtime: Runtime, snapshot: Snapshot, plan: Plan, ri
       status: outcome.status,
       quoteOut: formatUnits(outcome.quoteOut, 18),
       minimumOut: formatUnits(outcome.minOut, 18),
-      amountIn: formatUnits(outcome.amountIn, 18),
-      amountOut: formatUnits(outcome.amountOut, 18),
+      amountIn: outcome.amountIn === null ? null : formatUnits(outcome.amountIn, 18),
+      amountOut: outcome.amountOut === null ? null : formatUnits(outcome.amountOut, 18),
       swapTxHash: outcome.swapTxHash,
       approvalTxHash: outcome.approvalTxHash,
       decisionLogTxHash: outcome.registryTxHash,

@@ -2,6 +2,7 @@ import { readFile, mkdir, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Contract, JsonRpcProvider, Wallet, getAddress } from "ethers";
 import type { AgentConfig } from "./config.js";
+import publicRegistry from "../deployment/registry.json" with {type: "json"};
 
 export interface Runtime {
   config: AgentConfig;
@@ -11,7 +12,8 @@ export interface Runtime {
 }
 
 export async function createRuntime(config: AgentConfig): Promise<Runtime> {
-  const provider = new JsonRpcProvider(config.rpcUrl, config.chainId, {staticNetwork: true});
+  // Consecutive submissions must price the reserve against a fresh pending balance.
+  const provider = new JsonRpcProvider(config.rpcUrl, config.chainId, {staticNetwork: true, cacheTimeout: -1});
   await assertTestnet(provider, config.chainId);
   const wallet = new Wallet(await readPrivateKey(), provider);
   return {config, provider, wallet, walletAddress: wallet.address};
@@ -56,13 +58,35 @@ export async function assertTestnet(provider: JsonRpcProvider, chainId = 133): P
 
 export async function loadDecisionLogAddress(): Promise<string> {
   if (process.env.HSK_DECISION_LOG_ADDRESS) return getAddress(process.env.HSK_DECISION_LOG_ADDRESS);
-  try {
-    const deployment = JSON.parse(await readFile(resolve(".runtime/deployment.json"), "utf8")) as {decisionLog?: string};
-    if (deployment.decisionLog) return getAddress(deployment.decisionLog);
-  } catch {
-    // Deployment metadata is created by the deploy command.
+  const local = await readLocalDeployment();
+  if (local) return getAddress(local.decisionLog);
+  throw new Error("Set HSK_DECISION_LOG_ADDRESS to the deployed registry address");
+}
+
+async function readLocalDeployment(): Promise<{decisionLog: string; deployedAtBlock?: number} | null> {
+  for (const path of [".runtime/deployment.json", "artifacts/local-deployment.json"]) {
+    try {
+      return JSON.parse(await readFile(path, "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
-  throw new Error("DecisionLog is not configured; run npm run deploy on chain ID 133 first");
+  return null;
+}
+
+export async function loadAuditDeployment() {
+  const local = await readLocalDeployment();
+  const address = getAddress(process.env.HSK_DECISION_LOG_ADDRESS || local?.decisionLog || publicRegistry.decisionLog);
+  const localBlock = local && getAddress(local.decisionLog) === address ? local.deployedAtBlock : undefined;
+  const published = address === getAddress(publicRegistry.decisionLog);
+  if (published && localBlock !== undefined && localBlock !== publicRegistry.deployedAtBlock) {
+    throw new Error(`Local deployment block ${localBlock} is inconsistent with deployment/registry.json (${publicRegistry.deployedAtBlock})`);
+  }
+  const fromBlock = localBlock ?? (published ? publicRegistry.deployedAtBlock : undefined);
+  if (fromBlock === undefined || !Number.isSafeInteger(fromBlock) || fromBlock < 0) {
+    throw new Error(`Audit requires a deployment block for registry ${address}`);
+  }
+  return {address, fromBlock, agent: published ? getAddress(publicRegistry.agent) : null};
 }
 
 export async function persistDeployment(value: Record<string, unknown>): Promise<void> {

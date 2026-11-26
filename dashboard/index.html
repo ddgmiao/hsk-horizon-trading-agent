@@ -92,12 +92,12 @@
         const content = await response.text();
         const records = content.split(/\r?\n/).filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
         const latest = [...records].reverse().find((record) => record.balances || record.prices);
-        const swaps = records.filter((record) => record.execution?.swapTxHash && ["success", "swap_success_registry_failed"].includes(record.execution.status));
+        const swaps = records.filter((record) => record.execution?.swapTxHash && ["success", "swap_success_registry_failed", "swap_success_bounds_violation"].includes(record.execution.status));
         if (latest?.balances) {
           text(byId("balance0"), `${latest.balances.token0} TT2`);
           text(byId("balance1"), `${latest.balances.token1} TT1`);
           text(byId("price"), latest.prices?.token1PerToken0);
-          text(byId("value"), `${latest.balances.totalValueInToken1} TT2`);
+          text(byId("value"), `${latest.balances.totalValueInToken1} TT1`);
           text(byId("wallet"), latest.wallet ? `Agent ${short(latest.wallet)}` : "Wallet not observed");
         }
         text(byId("trades"), String(swaps.length));
@@ -141,10 +141,14 @@
           if (execution.decisionLogTxHash) {
             evidence.append(document.createTextNode(" · "), link(explorer + execution.decisionLogTxHash, "Decision"));
           }
-          if (execution.approvalTxHash) evidence.append(document.createTextNode(" · "), link(explorer + execution.approvalTxHash, "Approve"));
         } else if (record.txHash) {
           evidence.append(link(explorer + record.txHash, "Wrap"));
-        } else {
+        }
+        if (execution.approvalTxHash) {
+          if (evidence.childNodes.length) evidence.append(document.createTextNode(" · "));
+          evidence.append(link(explorer + execution.approvalTxHash, "Approve"));
+        }
+        if (!evidence.childNodes.length) {
           evidence.textContent = "--";
         }
         const trace = document.createElement("details");
@@ -161,6 +165,7 @@
         ].filter(Boolean).join("\n");
         trace.append(summary, pre);
         cellTime.append(trace);
+        rows.append(row);
       }
     }
 

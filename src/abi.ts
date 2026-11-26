@@ -3,6 +3,7 @@ export const FACTORY_ABI = [
 ];
 
 export const POOL_ABI = [
+  "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
   "function token0() view returns (address)",
   "function token1() view returns (address)",
   "function fee() view returns (uint24)",
@@ -11,6 +12,7 @@ export const POOL_ABI = [
 ];
 
 export const ERC20_ABI = [
+  "event Transfer(address indexed from,address indexed to,uint256 value)",
   "function balanceOf(address owner) view returns (uint256)",
   "function allowance(address owner,address spender) view returns (uint256)",
   "function approve(address spender,uint256 amount) returns (bool)",

@@ -2,6 +2,17 @@
 
 This guide uses only HashKey Chain Testnet (chain ID 133). The addresses in `.env.example` are derived from the Blockscout evidence summarized in [DISCOVERY.md](DISCOVERY.md). The HSKSwap frontend is currently jurisdiction-blocked, so the factory/router/token association is the strongest on-chain candidate set found, not a proven frontend configuration.
 
+## Read-only audit from a fresh checkout
+
+From the repository root with Node.js 22 or later, run
+
+```sh
+npm ci
+npm run audit
+```
+
+The audit needs only the public RPC. It reads the registry address, deployment block **36242135**, and agent **`0x3ebc1896581bc0566A21903cC64Ed7e66F62284e`** from `deployment/registry.json`. It queries the permissionless registry with the indexed agent address in windows of 1,000 blocks. For the published session, expect `eventCount: 2` and the two swap hashes in section 7, at registry event blocks **36242460** and **36242627**. Local metadata for this registry must agree with the published deployment block. A different registry needs its own deployment block and is scanned without a wallet filter; the result reports `agent: null` and the effective `fromBlock`.
+
 ## 1. Fund a fresh wallet
 
 Use the testnet faucet at <https://faucet.hskchain.net/faucet> and complete its human reCAPTCHA if the wallet needs funding. The observed drip is 0.1 HSK. This run started with 0.099699775767 HSK and ended with 0.089204694061578573 HSK on chain ID 133.
@@ -10,7 +21,7 @@ The built-in bootstrap uses `0.01 HSK` to mint WHSK through the verified `WHSK.d
 
 ## 2. Install and set the key file
 
-Use Node.js 22 or later. The key stays in a separate local file and must never be committed:
+Use Node.js 22 or later, with Linux `flock` (util-linux) for trading and observation. The key stays in a separate local file and must never be committed:
 
 ```sh
 npm ci
@@ -20,7 +31,7 @@ export HSK_AGENT_KEY_FILE=/absolute/path/to/key-file.json
 
 The file may contain raw `0x`-prefixed 32-byte hex or JSON shaped like `{"privateKey":"0x..."}`. The agent derives the wallet address at runtime. It does not print or log the key. No paid API key is used; the RPC is `https://testnet.hsk.xyz`.
 
-Optional settings can be exported from `.env.example` after replacing the key path:
+For trading, export `HSK_AGENT_KEY_FILE` and, on a fresh checkout, `HSK_DECISION_LOG_ADDRESS`. A local deployment file can supply the latter. Load the example values after editing the key path.
 
 ```sh
 cp .env.example .env
@@ -44,7 +55,7 @@ npm run preflight
 
 Preflight verifies bytecode, factory `getPool` results, pool token order and fee, active liquidity, `slot0`, QuoterV2 outputs, and wallet balances. It also reads the WHSK/TT1 bootstrap pool's runtime `slot0`, reports the gas conversion, and previews the fee-aware rebalance plan with six constraints. It does not send transactions, append ledger records, or save state.
 
-Expected results: `npm test` reports all tests passing (26 tests, including all 11 original tests, 0 failures) and `npm run check` (`tsc --noEmit`) exits silently with code 0. `npm run preflight` prints a JSON object whose first fields are `"status": "read_only_preflight"` and `"chainId": 133`, with a nonzero pool `liquidity`, a nonzero `quotes.token1OutFromWhsk`, a `gasFloor` object, a `rebalance.constraints` preview, and a `balances` object for the signer wallet. A thrown error, a zero quote, or a missing contract code means the path is not reproducible as configured. The selected pair is TT2 `0x0284eA6081C90fd5a48BCCc324C7bE1e46ea8cDb` / TT1 `0xC383e13C47112b76be60f41ef5E5d8f9A8E75aE5`, fee `3000`, pool `0xf826C65abDFF3B817e846DB4dfB68107CEFeB6b5`. The bootstrap pair is WHSK `0xCA8aAceEC5Db1e91B9Ed3a344bA026c4a2B3ebF6` / TT1, fee `3000`, pool `0x9fCdf0d609B36e2C8F8a194BeD2583c772d6EF76`.
+`npm test` should pass the original 26 tests and the audit, dashboard, and execution regression tests. `npm run check` (`tsc --noEmit`) exits silently with code 0. `npm run preflight` prints a JSON object whose first fields are `"status": "read_only_preflight"` and `"chainId": 133`, with a nonzero pool `liquidity`, a nonzero `quotes.token1OutFromWhsk`, a `gasFloor` object, a `rebalance.constraints` preview, and a `balances` object for the signer wallet. A thrown error, a zero quote, or a missing contract code means the path is not reproducible as configured. The selected pair is TT2 `0x0284eA6081C90fd5a48BCCc324C7bE1e46ea8cDb` / TT1 `0xC383e13C47112b76be60f41ef5E5d8f9A8E75aE5`, fee `3000`, pool `0xf826C65abDFF3B817e846DB4dfB68107CEFeB6b5`. The bootstrap pair is WHSK `0xCA8aAceEC5Db1e91B9Ed3a344bA026c4a2B3ebF6` / TT1, fee `3000`, pool `0x9fCdf0d609B36e2C8F8a194BeD2583c772d6EF76`.
 
 The pool and token contracts are on-chain candidates; their association with the official HSKSwap frontend could not be checked because the app origin returned an access-restriction page. The two token addresses supplied as initial leads are not pooled and are intentionally not used.
 
@@ -60,9 +71,15 @@ Start the monitor:
 npm run run
 ```
 
-With no TT1/TT2 balance, the agent checks the WHSK/TT1 quote, enforces its input and position caps, wraps `0.01 HSK`, and submits a Router02 `exactInputSingle`. After at least 300 seconds, the rebalance signal evaluates the TT1/TT2 allocation and may buy or sell based on the 50% target and 500 bps band. Every swap uses a QuoterV2 estimate and at least 99% of that estimate as `amountOutMinimum`.
+With no TT1/TT2 balance, the agent checks the WHSK/TT1 quote and input cap, wraps up to `0.01 HSK`, and rechecks its TT1 position cap on the quote used for Router02 `exactInputSingle`. Before each wrap, approval, swap, and registry write, it checks that the pending native balance covers the transaction value, the signed gas limit at its fee cap, the current L1 data-fee bound, the operator fee at the gas limit, and the configured reserve. After at least 300 seconds, the rebalance signal evaluates the TT1/TT2 allocation and may buy or sell based on the 50% target and 500 bps band. At the default 100 bps slippage, `amountOutMinimum` is 99% of the QuoterV2 execution quote, rounded down to an output base unit.
 
-Each poll appends prices, balances, signal, plan reason, all risk checks, and result to `logs/decisions.jsonl`. Each successful swap is followed by a `DecisionLogged` event that includes the swap hash. The six rebalance guards are:
+Each poll appends prices, balances, signal, plan reason, all risk checks, and result to `logs/decisions.jsonl`. For a mined swap, the agent reads the wallet-to-pool and pool-to-wallet transfers from the receipt. It also checks the routed pool’s Swap event, which can supply an amount if a transfer log is absent. It flags input different from the signed amount or output below the minimum. It journals the swap hash before broadcast and saves the confirmed cooldown before registry or balance reads. A restart reconciles the saved hash before another trade. If confirmation is unavailable, the hash stays pending. A registry failure is recorded alongside the local fill.
+
+Overlapping polls in one process share one cycle. Every cycle, bootstrap, and observation holds the state directory's `.agent.lock` through decision and settlement; separate processes wait on the same kernel lock. The kernel releases it when the owner exits, including a crash, so an abandoned file needs no deletion. Keep processes sharing a wallet on the same state directory, and never delete or replace a live lock file.
+
+Recovery runs before market verification. Fill timestamps and cooldowns use the receipt's block timestamp. The registry journal saves all nine `record()` arguments and its signed envelope before broadcast. If a saved hash has no receipt after a five-second wait, recovery rebuilds the call and rebroadcasts the identical envelope and nonce, then waits for confirmation. A recovered bootstrap refreshes its daily-loss baseline from observed post-fill holdings; a failed balance read leaves a durable baseline-refresh flag that blocks another trade until resolved. A corrupt final JSONL line is skipped with a warning, and only that damaged tail is removed before the next append; corruption in any earlier line fails closed.
+
+The six rebalance guards are listed below.
 
 | Constraint | Default |
 | --- | --- |
@@ -90,17 +107,11 @@ The old linear extrapolation differed from the measured fill by **33.5 bps ≈ 3
 ### 考虑过但未采用的增强（附实测理由）
 
 - **池 TWAP**: Main-pool `observationCardinality=1`; `observe` means for all six tested windows equal current tick **-11055**. TWAP is spot until observation cardinality is expanded and history accumulates. Those prerequisites are unmet; deferred.
-- **滞回带**: The verified ledger's post-fill weight was **5,006 bps**, followed by **9 rounds** of HOLD at **6 bps** deviation. No band-edge oscillation sample exists, so marginal value is zero. Reassess when oscillation samples appear.
+- **滞回带**: The verified ledger's post-fill weight was **5,006 bps**, followed by **8 rounds** of HOLD at **6 bps** deviation. No band-edge oscillation sample exists, so marginal value is zero. Reassess when oscillation samples appear.
 - **流动性份额上限**: **1%** of pool value equals **4.89 TT1** and would never trigger for this portfolio; the existing **0.1** cap occupies only **2.05 bps** of pool value. This decorative check is omitted.
 - **双池交叉校验**: The fee-500 and main pools show a structural basis of **18,223 bps** (**0.9344 vs 0.3311**). Any usable threshold would permanently block trading; omitted.
 
-Stop the loop with Ctrl+C. Inspect on-chain decision events with:
-
-```sh
-npm run audit
-```
-
-Expected results: the loop's first line is a JSON object with `"status": "agent_started"`, the wallet address, and the decision log address; each cycle then prints one JSON line (cycle statuses include `no_trade`, `risk_blocked`, and `success`). `npm run audit` prints an `eventCount` and the matching events; for the verified deployment it reports 2 events whose `swapTxHash` values equal the two swap transaction hashes in section 7.
+Stop the loop with Ctrl+C. Its first line identifies the wallet and registry. Each cycle prints its decision, including `no_trade`, `risk_blocked`, or `success`. The independent read-only audit command is at the top of this guide.
 
 ## 6. View the ledger
 
@@ -128,10 +139,16 @@ The 2026-11-26 run completed a bootstrap cycle and 12 further autonomous cycles 
 | Rebalance: 0.086090351630377497 TT1 → 0.259328888119975221 TT2 | Success; TT1 at 100% of portfolio value (5,000 bps above the 50% target) prompted the sale; settled at 50.06% of portfolio value (5,006 bps weight) | [`0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4`](https://testnet-explorer.hskchain.net/tx/0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4) |
 | Rebalance DecisionLogged event | Success, block 36242627 | [`0xd08e89bc145dad6378f01f62b671a76cf0a5059ddb5c30076a38d6760b180131`](https://testnet-explorer.hskchain.net/tx/0xd08e89bc145dad6378f01f62b671a76cf0a5059ddb5c30076a38d6760b180131) |
 
-Final on-chain balances at block 36242807: **0.089204694061578573 HSK**, **0 WHSK**, **0.259328888119975221 TT2**, and **0.086090351630377496 TT1**. At the last agent observation the portfolio value was 0.171952583404081495 TT1, with TT1 at 5,006 bps of portfolio value. All 17 JSONL records remain in `logs/decisions.jsonl`: 3 pre-funding observation records, the wrap record, and 13 funded-session decision records (the bootstrap buy, 4 sell plans of which 3 were held by the 300-second minimum interval and 1 executed, and 8 in-band holds).
+Final on-chain balances at block 36242807: **0.089204694061578573 HSK**, **0 WHSK**, **0.259328888119975221 TT2**, and **0.086090351630377496 TT1**. At the last agent observation the portfolio value was 0.171952583404081495 TT1, with TT1 at 5,006 bps of portfolio value. The 17 JSONL records start with two pre-funding rows. Row 3 records a reserve-blocked bootstrap at block 36242151, when the wallet already held 0.099699775767259497 HSK following the funding transaction at block 36242016. The wrap and bootstrap buy follow, then four sell plans (three interval-blocked, one executed) and eight in-band HOLDs on lines 10–17. [Funding transaction](https://testnet-explorer.hskchain.net/tx/0x00c8f424713cced004055bbcd62735cb951cee330cce316f7b931b8189791927)
+
+In the bootstrap buy on line 5, `addresses.pool` identifies the main TT2/TT1 observation pool. The swap receipt identifies the execution pool as WHSK/TT1 at `0x9fCdf0d609B36e2C8F8a194BeD2583c772d6EF76`. [Bootstrap receipt](https://testnet-explorer.hskchain.net/tx/0xb98e2e6b039342a364113aebaa1ebe656af8573344d1d70e76516964fb717d92)
 
 ## Keys and reproducibility
 
-This build uses no hosted LLM, paid market-data provider, or private RPC API key, so there are no third-party API keys to submit with it; the decision engine is a deterministic on-chain strategy whose inputs, guards, and outputs are all reproducible from the JSONL ledger. The only secret is each operator's own signer file, supplied through `HSK_AGENT_KEY_FILE`; it is not copied into the repository or included in logs. All other values, including addresses, fees, trade caps, timing, and slippage, are listed in `.env.example` and have evidence summarized in [DISCOVERY.md](DISCOVERY.md).
+The strategy reads prices, pool state, and asset balances from the public RPC. The clock, configuration, and persisted cooldown and daily-loss baselines are local inputs. The ledger shows sampled inputs and guard results. Snapshot RPC calls use unpinned `latest` and sample the block number separately. The historical bootstrap holds also omit the native balance. Exact replay requires these additional inputs. The verified fills can be checked independently against their receipts.
 
-The complete JSONL decision history, including the two earlier no-funds bootstrap holds, is preserved in `logs/decisions.jsonl` and served directly by the dashboard. The signer key remains outside the repository.
+State is bound to the signer. To retain an existing pre-upgrade state, verify its owner against the wallet’s ledger and receipts, then add the checksummed `wallet` address and `"pendingSwap": null` after accounting for any outstanding swap. Keep the existing cooldown, UTC day, baseline, and bootstrap flag. A submitted hash with an unknown receipt remains pending until reconciled.
+
+Every trading entry cross-checks the bound state against this wallet's ledger fills and keeps the later cooldown. A set daily-loss baseline must be a positive integer in raw TT1 units; zero is rejected. Older registry journals that already saved a hash without its signed envelope can still complete from a mined receipt, but an absent receipt requires manual reconciliation because an identical retry cannot be reconstructed safely.
+
+The only secret is the operator’s signer file, supplied through `HSK_AGENT_KEY_FILE`. The keyless audit uses the same public RPC. Configuration defaults are in `.env.example`. [Discovery evidence](DISCOVERY.md)
