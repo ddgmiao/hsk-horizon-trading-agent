@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.keystore
+wallet*.json
+agent-key*.json
+*private*key*
+*secret*
+secrets/
+.runtime/
+artifacts/local-deployment.json
+logs/local*
+*.lock.tmp

@@ -1,0 +1,23 @@
+{
+  "name": "horizon-133",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Auditable inventory-rebalancing agent for HSK Chain Testnet",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "discover": "tsx src/cli.ts discover",
+    "preflight": "tsx src/cli.ts preflight",
+    "observe": "tsx src/cli.ts observe",
+    "run": "tsx src/cli.ts run",
+    "bootstrap": "tsx src/cli.ts bootstrap",
+    "compile": "tsx src/compile.ts",
+    "deploy": "tsx src/cli.ts deploy",
+    "audit": "tsx src/cli.ts audit",
+    "dashboard": "node scripts/serve.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {"ethers": "6.16.0"},
+  "devDependencies": {"@types/node": "24.10.1", "solc": "0.8.30", "tsx": "4.21.0", "typescript": "5.9.3"}
+}
