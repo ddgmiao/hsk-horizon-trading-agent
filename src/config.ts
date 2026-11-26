@@ -21,7 +21,7 @@ const DEFAULTS = {
   minTradeIntervalSeconds: 300,
   maxDailyLossBps: 500,
   bootstrapHsk: "0.01",
-  // Measured fees are about 0.0003 HSK per transaction; 0.02 HSK still leaves trade budget after the 0.1 HSK drip.
+  // Measured session gas: 0.000300 HSK for the one-off contract deployment and 0.000036-0.000142 HSK per routine transaction; 0.02 HSK still leaves trade budget after the 0.1 HSK drip.
   hskGasReserve: "0.02",
   pollSeconds: 30,
   maxCycles: 0,

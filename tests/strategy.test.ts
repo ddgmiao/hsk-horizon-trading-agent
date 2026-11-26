@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ONE, evaluateRisk, planRebalance, priceX18FromSqrtPrice } from "../src/strategy.js";
+import { ABSOLUTE_MAX_SLIPPAGE_BPS, ONE, evaluateRisk, planRebalance, priceX18FromSqrtPrice } from "../src/strategy.js";
 
 test("converts a Uniswap V3 sqrt price to the 18 decimal quote ratio", () => {
   assert.equal(priceX18FromSqrtPrice(2n ** 96n), ONE);
@@ -54,6 +54,21 @@ test("risk gates enforce the position cap, slippage ceiling, trade interval, and
   assert.equal(checks.find((check) => check.name === "min_trade_interval")?.passed, false);
   assert.equal(checks.find((check) => check.name === "daily_loss_halt")?.passed, false);
   assert.equal(checks.find((check) => check.name === "slippage_cap")?.passed, true);
+});
+
+test("slippage cap fails when the configured slippage exceeds the absolute ceiling", () => {
+  const plan = planRebalance({balance0: ONE, balance1: 0n, price1Per0X18: ONE}, {
+    targetToken1Bps: 5000, rebalanceBandBps: 500, maxTradeInput: ONE / 10n, maxPositionQuote: 2n * ONE,
+  });
+  const base = {
+    plan, maxTradeInput: ONE, maxPositionQuote: 2n * ONE,
+    nowMs: 10000, lastTradeAtMs: null, minTradeIntervalMs: 300000,
+    portfolioValueQuote: ONE, dailyStartValueQuote: null, maxDailyLossBps: 500,
+  };
+  const over = evaluateRisk({...base, maxSlippageBps: ABSOLUTE_MAX_SLIPPAGE_BPS, configuredSlippageBps: ABSOLUTE_MAX_SLIPPAGE_BPS + 1});
+  assert.equal(over.find((check) => check.name === "slippage_cap")?.passed, false);
+  const within = evaluateRisk({...base, maxSlippageBps: ABSOLUTE_MAX_SLIPPAGE_BPS, configuredSlippageBps: 100});
+  assert.equal(within.find((check) => check.name === "slippage_cap")?.passed, true);
 });
 
 test("buy is denied when the target position exceeds the configured cap", () => {

@@ -2,13 +2,13 @@
 
 Horizon 133 is a deterministic inventory-rebalancing agent for HashKey Chain Testnet. It reads a Uniswap V3 pool's `slot0`, computes a token allocation signal, applies position, trade-size, slippage, interval, and daily-loss guards, and sends swaps through the verified SwapRouter02 candidate. It records every observation and decision as JSON Lines and emits an on-chain decision event for each completed swap.
 
-The strategy uses only chain data and needs no paid API key or LLM. The agent trades directly from its EOA; the small `AgentDecisionLog` contract records completed swaps without custody. Direct routing keeps the test wallet's assets under the key holder's control and avoids a vault approval surface.
+The strategy uses only chain data and needs no paid API key or LLM. The decision engine is deliberately deterministic: every input is on-chain data, every guard is explicit, and every decision is reproducible from the JSONL ledger; the autonomy is in the unattended sense-decide-act loop, not in a hosted model. The agent trades directly from its EOA; the small `AgentDecisionLog` contract records completed swaps without custody. Direct routing keeps the test wallet's assets under the key holder's control and avoids a vault approval surface.
 
 ## Current status
 
 The implementation, offline tests, and live testnet session are complete. The full JSONL decision ledger is in `logs/decisions.jsonl`; the dashboard serves this same file at `/logs/decisions.jsonl`.
 
-The agent uses a **0.02 HSK gas reserve**. The measured testnet fee is about **0.0003 HSK per transaction**, so the 0.1 HSK faucet drip still leaves operating funds after reserve. `AgentDecisionLog` is already deployed at `0xfb3e5F2d31A1a473CC09C847A4B564C0c2C46FD1` by transaction [`0x4fe2bd18ee9eb9c60f93b7fcc6fdcb28a5fb520816508206e3c92bc138283d85`](https://testnet-explorer.hskchain.net/tx/0x4fe2bd18ee9eb9c60f93b7fcc6fdcb28a5fb520816508206e3c92bc138283d85); do not redeploy it. The live session started with 0.099699775767 HSK and finished with 0.089204694061578573 HSK.
+The agent uses a **0.02 HSK gas reserve**. Measured gas for the verified session was **0.000300 HSK** for the one-off contract deployment and **0.000036–0.000142 HSK** for each routine transaction (wrap, approvals, swaps, decision records), so the 0.1 HSK faucet drip still leaves operating funds after reserve. `AgentDecisionLog` is already deployed at `0xfb3e5F2d31A1a473CC09C847A4B564C0c2C46FD1` by transaction [`0x4fe2bd18ee9eb9c60f93b7fcc6fdcb28a5fb520816508206e3c92bc138283d85`](https://testnet-explorer.hskchain.net/tx/0x4fe2bd18ee9eb9c60f93b7fcc6fdcb28a5fb520816508206e3c92bc138283d85); do not redeploy it. The live session started with 0.099699775767 HSK and finished with 0.089204694061578573 HSK.
 
 There is a second discovery limitation: the HSKSwap app origin returned a jurisdiction restriction page, so its frontend could not be inspected. Factory `0x2dC2...`, router `0xa691...`, QuoterV2 `0x73820...`, and the verified `TestToken1`/`TestToken2` pools form the strongest coherent testnet candidate set, but the exact official app-to-address and official-token association could not be proven from accessible evidence. See [DISCOVERY.md](DISCOVERY.md).
 
@@ -65,7 +65,7 @@ The first two transactions are discovery context only, not Horizon 133 entry tra
 
 ## Verified live testnet session
 
-On 2026-11-26 the agent completed 12 autonomous cycles on chain ID 133. Both swaps, their approvals, the wrap, the deployment, and both DecisionLog transactions have successful receipts. Each DecisionLogged event references its matching swap hash.
+On 2026-11-26 the agent completed a bootstrap cycle and 12 further autonomous cycles on chain ID 133. Both swaps, their approvals, the wrap, the deployment, and both DecisionLog transactions have successful receipts. Each DecisionLogged event references its matching swap hash.
 
 | Step | Result | On-chain transaction |
 | --- | --- | --- |
@@ -74,10 +74,10 @@ On 2026-11-26 the agent completed 12 autonomous cycles on chain ID 133. Both swa
 | Bootstrap swap: 0.01 WHSK → 0.172180703260754993 TT1 | Success; empty inventory triggered bootstrap | [`0xb98e2e6b039342a364113aebaa1ebe656af8573344d1d70e76516964fb717d92`](https://testnet-explorer.hskchain.net/tx/0xb98e2e6b039342a364113aebaa1ebe656af8573344d1d70e76516964fb717d92) |
 | Record bootstrap decision | Success, block 36242460 | [`0x9a17d7b4c9e8a2db457cc50e0a905f9ebe713404cb3ec26b3c454dda8cf8598f`](https://testnet-explorer.hskchain.net/tx/0x9a17d7b4c9e8a2db457cc50e0a905f9ebe713404cb3ec26b3c454dda8cf8598f) |
 | Approve TT1 to SwapRouter02 | Success, block 36242620 | [`0x06f21d08be3be649507105b8e89b7f4039394864af5a6e9fb149e4d8c88ef574`](https://testnet-explorer.hskchain.net/tx/0x06f21d08be3be649507105b8e89b7f4039394864af5a6e9fb149e4d8c88ef574) |
-| Rebalance swap: 0.086090351630377497 TT1 → 0.259328888119975221 TT2 | Success; TT1 was 5,000 bps above target, then settled at 5,006 bps | [`0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4`](https://testnet-explorer.hskchain.net/tx/0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4) |
+| Rebalance swap: 0.086090351630377497 TT1 → 0.259328888119975221 TT2 | Success; TT1 was 100% of portfolio value (5,000 bps above the 50% target), then settled at 50.06% of portfolio value (5,006 bps weight) | [`0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4`](https://testnet-explorer.hskchain.net/tx/0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4) |
 | Record rebalance decision | Success, block 36242627 | [`0xd08e89bc145dad6378f01f62b671a76cf0a5059ddb5c30076a38d6760b180131`](https://testnet-explorer.hskchain.net/tx/0xd08e89bc145dad6378f01f62b671a76cf0a5059ddb5c30076a38d6760b180131) |
 
-The final balance read at block 36242807 returned **0.089204694061578573 HSK**, **0 WHSK**, **0.259328888119975221 TT2**, and **0.086090351630377496 TT1**. At the last agent observation, the portfolio was valued at 0.171952583404081495 TT1 with a 5,006 bps TT1 weight, inside the configured 500 bps rebalance band. The 17-record JSONL ledger includes the two trades and earlier pre-run observations. The on-chain audit reports two matching DecisionLogged events.
+The final balance read at block 36242807 returned **0.089204694061578573 HSK**, **0 WHSK**, **0.259328888119975221 TT2**, and **0.086090351630377496 TT1**. At the last agent observation, the portfolio was valued at 0.171952583404081495 TT1 with a 5,006 bps TT1 weight, inside the configured 500 bps rebalance band. The 17-record JSONL ledger comprises 3 pre-funding observation records, the wrap record, and 13 funded-session decision records: the bootstrap buy, 4 sell plans (3 held by the 300-second minimum interval, 1 executed), and 8 in-band holds. The on-chain audit reports two matching DecisionLogged events.
 
 ## Run locally
 
@@ -103,7 +103,7 @@ Run the static dashboard at <http://127.0.0.1:4173> with `npm run dashboard`. It
 
 ## Reproduction values
 
-The exact defaults live in [.env.example](.env.example). Important values are chain ID `133`, factory `0x2dC2...`, router `0xa691...`, QuoterV2 `0x73820...`, TT2 `0x0284...`, TT1 `0xC383...`, pair fee `3000`, target weight `5000` bps, band `500` bps, max input `0.1`, max position `2` TT1, slippage `100` bps, minimum interval `300` seconds, daily loss limit `500` bps, bootstrap input `0.01` HSK, and gas reserve `0.02` HSK. The reserve reflects the measured fee of about `0.0003` HSK per transaction.
+The exact defaults live in [.env.example](.env.example). Important values are chain ID `133`, factory `0x2dC2...`, router `0xa691...`, QuoterV2 `0x73820...`, TT2 `0x0284...`, TT1 `0xC383...`, pair fee `3000`, target weight `5000` bps, band `500` bps, max input `0.1`, max position `2` TT1, slippage `100` bps, minimum interval `300` seconds, daily loss limit `500` bps, bootstrap input `0.01` HSK, and gas reserve `0.02` HSK. The reserve is sized against the measured session fees above (0.000300 HSK one-off deployment; 0.000036–0.000142 HSK per routine transaction).
 
 ## Stage commits
 

@@ -42,7 +42,9 @@ npm run check
 npm run preflight
 ```
 
-Preflight verifies bytecode, factory `getPool` results, pool token order and fee, active liquidity, `slot0`, QuoterV2 outputs, and wallet balances. The selected pair is TT2 `0x0284eA6081C90fd5a48BCCc324C7bE1e46ea8cDb` / TT1 `0xC383e13C47112b76be60f41ef5E5d8f9A8E75aE5`, fee `3000`, pool `0xf826C65abDFF3B817e846DB4dfB68107CEFeB6b5`. The bootstrap pair is WHSK `0xCA8aAceEC5Db1e91B9Ed3a344bA026c4a2B3ebF6` / TT1, fee `3000`, pool `0x9fCdf0d609B36e2C8F8a194BeD2583c772d6EF76`.
+Preflight verifies bytecode, factory `getPool` results, pool token order and fee, active liquidity, `slot0`, QuoterV2 outputs, and wallet balances.
+
+Expected results: `npm test` reports all tests passing (11 tests, 0 failures at this commit) and `npm run check` exits silently with code 0. `npm run preflight` prints a JSON object whose first fields are `"status": "read_only_preflight"` and `"chainId": 133`, with a nonzero pool `liquidity`, a nonzero `quotes.token1OutFromWhsk`, and a `balances` object for the signer wallet. A thrown error, a zero quote, or a missing contract code means the path is not reproducible as configured. The selected pair is TT2 `0x0284eA6081C90fd5a48BCCc324C7bE1e46ea8cDb` / TT1 `0xC383e13C47112b76be60f41ef5E5d8f9A8E75aE5`, fee `3000`, pool `0xf826C65abDFF3B817e846DB4dfB68107CEFeB6b5`. The bootstrap pair is WHSK `0xCA8aAceEC5Db1e91B9Ed3a344bA026c4a2B3ebF6` / TT1, fee `3000`, pool `0x9fCdf0d609B36e2C8F8a194BeD2583c772d6EF76`.
 
 The pool and token contracts are on-chain candidates; their association with the official HSKSwap frontend could not be checked because the app origin returned an access-restriction page. The two token addresses supplied as initial leads are not pooled and are intentionally not used.
 
@@ -68,6 +70,8 @@ Stop the loop with Ctrl+C. Inspect on-chain decision events with:
 npm run audit
 ```
 
+Expected results: the loop's first line is a JSON object with `"status": "agent_started"`, the wallet address, and the decision log address; each cycle then prints one JSON line (cycle statuses include `no_trade`, `risk_blocked`, and `success`). `npm run audit` prints an `eventCount` and the matching events; for the verified deployment it reports 2 events whose `swapTxHash` values equal the two swap transaction hashes in section 7.
+
 ## 6. View the ledger
 
 In another terminal, serve the dashboard:
@@ -80,7 +84,7 @@ Open <http://127.0.0.1:4173>. The dashboard reads the live `logs/decisions.jsonl
 
 ## 7. Verified live session
 
-The 2026-11-26 run completed 12 autonomous cycles on testnet. It wrapped HSK, bootstrapped TT1, waited for the 300-second trade interval, sold TT1 into TT2, and then held once the allocation returned inside the configured band. All listed transactions have successful receipts, and `npm run audit` found two DecisionLogged events with swap hashes matching the router transactions.
+The 2026-11-26 run completed a bootstrap cycle and 12 further autonomous cycles on testnet. It wrapped HSK, bootstrapped TT1, waited for the 300-second trade interval, sold TT1 into TT2, and then held once the allocation returned inside the configured band. All listed transactions have successful receipts, and `npm run audit` found two DecisionLogged events with swap hashes matching the router transactions.
 
 | Step | Outcome | Explorer transaction |
 | --- | --- | --- |
@@ -89,13 +93,13 @@ The 2026-11-26 run completed 12 autonomous cycles on testnet. It wrapped HSK, bo
 | Bootstrap: 0.01 WHSK → 0.172180703260754993 TT1 | Success; no inventory triggered the seed buy | [`0xb98e2e6b039342a364113aebaa1ebe656af8573344d1d70e76516964fb717d92`](https://testnet-explorer.hskchain.net/tx/0xb98e2e6b039342a364113aebaa1ebe656af8573344d1d70e76516964fb717d92) |
 | Bootstrap DecisionLogged event | Success, block 36242460 | [`0x9a17d7b4c9e8a2db457cc50e0a905f9ebe713404cb3ec26b3c454dda8cf8598f`](https://testnet-explorer.hskchain.net/tx/0x9a17d7b4c9e8a2db457cc50e0a905f9ebe713404cb3ec26b3c454dda8cf8598f) |
 | Approve TT1 to router | Success, block 36242620 | [`0x06f21d08be3be649507105b8e89b7f4039394864af5a6e9fb149e4d8c88ef574`](https://testnet-explorer.hskchain.net/tx/0x06f21d08be3be649507105b8e89b7f4039394864af5a6e9fb149e4d8c88ef574) |
-| Rebalance: 0.086090351630377497 TT1 → 0.259328888119975221 TT2 | Success; 5,000 bps above target prompted sale; settled at 5,006 bps | [`0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4`](https://testnet-explorer.hskchain.net/tx/0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4) |
+| Rebalance: 0.086090351630377497 TT1 → 0.259328888119975221 TT2 | Success; TT1 at 100% of portfolio value (5,000 bps above the 50% target) prompted the sale; settled at 50.06% of portfolio value (5,006 bps weight) | [`0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4`](https://testnet-explorer.hskchain.net/tx/0x67df0cc6e2013ef7981402c7b8d93e85b0aff7064abe439c0feddef5e17815c4) |
 | Rebalance DecisionLogged event | Success, block 36242627 | [`0xd08e89bc145dad6378f01f62b671a76cf0a5059ddb5c30076a38d6760b180131`](https://testnet-explorer.hskchain.net/tx/0xd08e89bc145dad6378f01f62b671a76cf0a5059ddb5c30076a38d6760b180131) |
 
-Final on-chain balances at block 36242807: **0.089204694061578573 HSK**, **0 WHSK**, **0.259328888119975221 TT2**, and **0.086090351630377496 TT1**. At the last agent observation the portfolio value was 0.171952583404081495 TT1, with TT1 at 5,006 bps of portfolio value. All 17 JSONL decision records remain in `logs/decisions.jsonl`.
+Final on-chain balances at block 36242807: **0.089204694061578573 HSK**, **0 WHSK**, **0.259328888119975221 TT2**, and **0.086090351630377496 TT1**. At the last agent observation the portfolio value was 0.171952583404081495 TT1, with TT1 at 5,006 bps of portfolio value. All 17 JSONL records remain in `logs/decisions.jsonl`: 3 pre-funding observation records, the wrap record, and 13 funded-session decision records (the bootstrap buy, 4 sell plans of which 3 were held by the 300-second minimum interval and 1 executed, and 8 in-band holds).
 
 ## Keys and reproducibility
 
-This build uses no hosted LLM, paid market-data provider, or private RPC API key. The only secret is each operator's own signer file, supplied through `HSK_AGENT_KEY_FILE`; it is not copied into the repository or included in logs. All other values, including addresses, fees, trade caps, timing, and slippage, are listed in `.env.example` and have evidence summarized in [DISCOVERY.md](DISCOVERY.md).
+This build uses no hosted LLM, paid market-data provider, or private RPC API key, so there are no third-party API keys to submit with it; the decision engine is a deterministic on-chain strategy whose inputs, guards, and outputs are all reproducible from the JSONL ledger. The only secret is each operator's own signer file, supplied through `HSK_AGENT_KEY_FILE`; it is not copied into the repository or included in logs. All other values, including addresses, fees, trade caps, timing, and slippage, are listed in `.env.example` and have evidence summarized in [DISCOVERY.md](DISCOVERY.md).
 
 The complete JSONL decision history, including the two earlier no-funds bootstrap holds, is preserved in `logs/decisions.jsonl` and served directly by the dashboard. The signer key remains outside the repository.

@@ -28,6 +28,7 @@ try {
       break;
     default:
       output = {commands: ["discover", "preflight", "observe", "deploy", "bootstrap", "run", "audit"]};
+      process.exitCode = 1;
   }
   if (output !== undefined) console.log(JSON.stringify(output, bigintReplacer, 2));
 } catch (error) {

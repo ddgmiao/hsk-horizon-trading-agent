@@ -1,4 +1,4 @@
-import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { readFile, mkdir, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Contract, JsonRpcProvider, Wallet, getAddress } from "ethers";
 import type { AgentConfig } from "./config.js";
@@ -22,9 +22,14 @@ export async function readPrivateKey(): Promise<string> {
   if (!keyPath) throw new Error("HSK_AGENT_KEY_FILE must point to a private key file");
   let text: string;
   try {
+    const info = await stat(keyPath);
+    if ((info.mode & 0o077) !== 0) {
+      console.error(`Warning: ${keyPath} is accessible by group or other users (mode ${(info.mode & 0o777).toString(8)}); chmod 600 is recommended for a private key file.`);
+    }
     text = (await readFile(keyPath, "utf8")).trim();
-  } catch {
-    throw new Error("Could not read HSK_AGENT_KEY_FILE");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new Error(`Could not read HSK_AGENT_KEY_FILE${code ? ` (${code})` : ""}`);
   }
 
   let key = text;

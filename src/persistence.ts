@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export interface AgentState {
@@ -14,22 +14,36 @@ export function utcDay(timestampMs: number): string {
 
 export async function loadState(path: string, nowMs = Date.now()): Promise<AgentState> {
   const day = utcDay(nowMs);
+  let text: string;
   try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<AgentState>;
-    return {
-      lastTradeAtMs: Number.isFinite(parsed.lastTradeAtMs) ? parsed.lastTradeAtMs! : null,
-      utcDay: parsed.utcDay || day,
-      dailyStartValueQuote: parsed.utcDay === day && parsed.dailyStartValueQuote ? parsed.dailyStartValueQuote : null,
-      bootstrapComplete: parsed.bootstrapComplete === true,
-    };
-  } catch {
-    return {lastTradeAtMs: null, utcDay: day, dailyStartValueQuote: null, bootstrapComplete: false};
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {lastTradeAtMs: null, utcDay: day, dailyStartValueQuote: null, bootstrapComplete: false};
+    }
+    throw error;
   }
+  let parsed: Partial<AgentState>;
+  try {
+    parsed = JSON.parse(text) as Partial<AgentState>;
+  } catch {
+    throw new Error(
+      `Agent state file ${path} is not valid JSON; refusing to trade with silently reset risk baselines. Repair the file, or remove it to start fresh.`,
+    );
+  }
+  return {
+    lastTradeAtMs: Number.isFinite(parsed.lastTradeAtMs) ? parsed.lastTradeAtMs! : null,
+    utcDay: parsed.utcDay || day,
+    dailyStartValueQuote: parsed.utcDay === day && parsed.dailyStartValueQuote ? parsed.dailyStartValueQuote : null,
+    bootstrapComplete: parsed.bootstrapComplete === true,
+  };
 }
 
 export async function saveState(path: string, state: AgentState): Promise<void> {
   await mkdir(dirname(path), {recursive: true});
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, {mode: 0o600});
+  const tmpPath = `${path}.tmp`;
+  await writeFile(tmpPath, `${JSON.stringify(state, null, 2)}\n`, {mode: 0o600});
+  await rename(tmpPath, path);
 }
 
 export async function appendJsonLine(path: string, value: unknown): Promise<void> {

@@ -1,5 +1,8 @@
 export const Q96 = 2n ** 96n;
 export const ONE = 10n ** 18n;
+// Absolute ceiling for the slippage_cap risk check, independent of the
+// configured per-trade slippage so the check compares two distinct sources.
+export const ABSOLUTE_MAX_SLIPPAGE_BPS = 1000;
 
 export type Action = "HOLD" | "BUY_TOKEN1" | "SELL_TOKEN1";
 

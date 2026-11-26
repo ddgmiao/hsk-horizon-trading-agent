@@ -5,7 +5,7 @@ import { DECISION_LOG_ABI, ERC20_ABI, FACTORY_ABI, POOL_ABI, QUOTER_V2_ABI, ROUT
 import { compileDecisionLog } from "./compile.js";
 import { appendJsonLine, loadState, saveState, utcDay, type AgentState } from "./persistence.js";
 import { assertTestnet, createRuntime, loadDecisionLogAddress, persistDeployment, type Runtime } from "./runtime.js";
-import { evaluateRisk, ONE, planRebalance, priceX18FromSqrtPrice, type Plan, type RiskCheck } from "./strategy.js";
+import { ABSOLUTE_MAX_SLIPPAGE_BPS, evaluateRisk, ONE, planRebalance, priceX18FromSqrtPrice, type Plan, type RiskCheck } from "./strategy.js";
 
 type Snapshot = {
   blockNumber: number;
@@ -340,7 +340,7 @@ async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapsh
     plan,
     maxTradeInput: config.maxTradeInput,
     maxPositionQuote: config.maxPositionQuote,
-    maxSlippageBps: config.maxSlippageBps,
+    maxSlippageBps: ABSOLUTE_MAX_SLIPPAGE_BPS,
     configuredSlippageBps: config.maxSlippageBps,
     nowMs: now,
     lastTradeAtMs: state.lastTradeAtMs,
@@ -484,7 +484,12 @@ async function executeSwap(runtime: Runtime, input: {
   const afterOutput = BigInt(await tokenOut.balanceOf(walletAddress));
   const actualInput = beforeInput - afterInput;
   const actualOutput = afterOutput - beforeOutput;
-  if (actualInput <= 0n || actualOutput < minOut) throw new Error("Swap receipt balances did not satisfy the signed amount bounds");
+  // The swap is already settled on-chain at this point. A bounds violation
+  // must not throw the settled trade away: record it (including the on-chain
+  // decision log below) and surface the violation in the outcome instead.
+  const boundsError = actualInput <= 0n || actualOutput < minOut
+    ? `Swap ${tx.hash} settled outside the signed amount bounds (actualInput=${actualInput}, actualOutput=${actualOutput}, minOut=${minOut})`
+    : undefined;
 
   let registryTxHash: string | null = null;
   let registryError: string | undefined;
@@ -514,8 +519,12 @@ async function executeSwap(runtime: Runtime, input: {
     registryError = errorMessage(error);
   }
 
+  const errors = [
+    ...(boundsError ? [boundsError] : []),
+    ...(registryError ? [`Swap succeeded but on-chain decision logging failed: ${registryError}`] : []),
+  ];
   return {
-    status: registryError ? "swap_success_registry_failed" : "success",
+    status: boundsError ? "swap_success_bounds_violation" : registryError ? "swap_success_registry_failed" : "success",
     swapTxHash: tx.hash,
     registryTxHash,
     decisionLogAddress: registryAddress,
@@ -524,7 +533,7 @@ async function executeSwap(runtime: Runtime, input: {
     amountOut: actualOutput,
     quoteOut,
     minOut,
-    ...(registryError ? {error: `Swap succeeded but on-chain decision logging failed: ${registryError}`} : {}),
+    ...(errors.length ? {error: errors.join("; ")} : {}),
   };
 }
 
@@ -591,7 +600,7 @@ function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, portf
     plan,
     maxTradeInput: config.maxTradeInput,
     maxPositionQuote: config.maxPositionQuote,
-    maxSlippageBps: config.maxSlippageBps,
+    maxSlippageBps: ABSOLUTE_MAX_SLIPPAGE_BPS,
     configuredSlippageBps: config.maxSlippageBps,
     nowMs,
     lastTradeAtMs: state.lastTradeAtMs,
