@@ -46,8 +46,13 @@ export interface RiskInput {
   maxDailyLossBps: number;
   // Supplied only for rebalance plans; bootstrap keeps its existing guards.
   gasFloor?: {
+    balance0: bigint;
+    balance1: bigint;
+    targetToken1Bps: number;
+    quoteOut: bigint;
     price1Per0X18: bigint;
     token1PerWhskX18: bigint;
+    // Whole remaining path: swap + registry + approval if needed.
     estimatedGasHsk: bigint;
     minGasMultiple: number;
   };
@@ -83,7 +88,8 @@ export function planRebalance(input: RebalanceInput, config: StrategyConfig): Pl
     return holdPlan(totalValueQuote, targetToken1ValueQuote, currentToken1WeightBps, deviationBps, "No inventory; wait for bootstrap funds.");
   }
 
-  if (Math.abs(deviationBps) <= config.rebalanceBandBps) {
+  const allocationErrorScaled = input.balance1 * 10000n - target * totalValueQuote;
+  if (abs(allocationErrorScaled) <= BigInt(config.rebalanceBandBps) * totalValueQuote) {
     return holdPlan(totalValueQuote, targetToken1ValueQuote, currentToken1WeightBps, deviationBps, "Token1 allocation is inside the rebalance band.");
   }
 
@@ -153,20 +159,35 @@ export function evaluateRisk(input: RiskInput): RiskCheck[] {
     {name: "daily_loss_halt", passed: lossCheckPassed, detail: `current_value=${input.portfolioValueQuote}; day_start_value=${input.dailyStartValueQuote ?? "unset"}; limit=${input.maxDailyLossBps} bps`},
   ];
   if (input.gasFloor) {
-    const {price1Per0X18, token1PerWhskX18, estimatedGasHsk, minGasMultiple} = input.gasFloor;
-    const inputValueQuote = input.plan.tokenInIndex === 0
-      ? input.plan.amountIn * price1Per0X18 / ONE
-      : input.plan.amountIn;
+    const {balance0, balance1, targetToken1Bps, quoteOut, price1Per0X18, token1PerWhskX18, estimatedGasHsk, minGasMultiple} = input.gasFloor;
+    const buying = input.plan.tokenInIndex === 0;
+    const after0 = balance0 + (buying ? -input.plan.amountIn : quoteOut);
+    const after1 = balance1 + (buying ? quoteOut : -input.plan.amountIn);
+    const beforeValue = balance0 * price1Per0X18 / ONE + balance1;
+    const afterValue = after0 * price1Per0X18 / ONE + after1;
+    // Keep the target fraction exact through the comparison. The quote includes
+    // fees and curvature; both portfolios use the unchanged decision marks.
+    const beforeError = abs(balance1 * 10000n - BigInt(targetToken1Bps) * beforeValue);
+    const afterError = abs(after1 * 10000n - BigInt(targetToken1Bps) * afterValue);
+    const errorRemoved = beforeError - afterError;
     // HSK and WHSK are 1:1; the conversion uses the live bootstrap slot0.
-    const gasCostQuote = estimatedGasHsk * token1PerWhskX18 / ONE;
-    const minimumValueQuote = gasCostQuote * BigInt(minGasMultiple);
+    const gasCostQuote = ceilDiv(estimatedGasHsk * token1PerWhskX18, ONE);
+    const minimumValueQuote = ceilDiv(estimatedGasHsk * token1PerWhskX18 * BigInt(minGasMultiple), ONE);
     checks.push({
       name: "gas_floor",
-      passed: !activeTrade || inputValueQuote >= minimumValueQuote,
-      detail: `input_value_quote=${inputValueQuote}; estimated_gas_cost_quote=${gasCostQuote}; min_gas_multiple=${minGasMultiple}; minimum_value_quote=${minimumValueQuote}`,
+      passed: !activeTrade || (after0 >= 0n && after1 >= 0n && errorRemoved * ONE >= estimatedGasHsk * token1PerWhskX18 * BigInt(minGasMultiple) * 10000n),
+      detail: `error_before_scaled=${beforeError}; error_after_scaled=${afterError}; error_removed_scaled=${errorRemoved}; estimated_gas_cost_quote=${gasCostQuote}; min_gas_multiple=${minGasMultiple}; minimum_value_quote=${minimumValueQuote}`,
     });
   }
   return checks;
+}
+
+export function ceilDiv(numerator: bigint, denominator: bigint): bigint {
+  return (numerator + denominator - 1n) / denominator;
+}
+
+function abs(value: bigint): bigint {
+  return value < 0n ? -value : value;
 }
 
 function holdPlan(totalValueQuote: bigint, targetToken1ValueQuote: bigint, currentToken1WeightBps: number, deviationBps: number, reason: string): Plan {

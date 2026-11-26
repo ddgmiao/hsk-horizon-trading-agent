@@ -97,6 +97,12 @@ function gasFloorChecks(amountIn: bigint, multiple = 2, tokenInIndex: 0 | 1 = 1,
     nowMs: 10000, lastTradeAtMs: null, minTradeIntervalMs: 300000,
     portfolioValueQuote: plan.totalValueQuote, dailyStartValueQuote: null, maxDailyLossBps: 500,
     gasFloor: {
+      // A lossless quote that removes exactly the marked input value from D.
+      // Balances are deliberately far from target to avoid crossing it.
+      balance0: tokenInIndex === 0 ? ONE : 0n,
+      balance1: tokenInIndex === 0 ? 0n : ONE,
+      targetToken1Bps: 5000,
+      quoteOut: tokenInIndex === 0 ? amountIn * price1Per0X18 / ONE : amountIn * ONE / price1Per0X18,
       price1Per0X18, token1PerWhskX18: 1725n * ONE / 100n,
       estimatedGasHsk: 120n * ONE / 1000000n, minGasMultiple: multiple,
     },
@@ -187,4 +193,52 @@ test("fee-aware planning preserves inventory and input caps and rejects invalid 
   for (const poolFee of [-1, 0.5, Number(FEE_DENOMINATOR), NaN]) {
     assert.throws(() => planRebalance(input, {...config, poolFee}), /pool fee/);
   }
+});
+
+test("band comparison is symmetric just outside, on, and inside both exact edges", () => {
+  const config = {poolFee: 3000, targetToken1Bps: 5000, rebalanceBandBps: 500, maxTradeInput: ONE, maxPositionQuote: 2n * ONE};
+  for (const [upper, expected] of [[55005n, "SELL_TOKEN1"], [55000n, "HOLD"], [54995n, "HOLD"]] as const) {
+    const high = planRebalance({balance0: (100000n - upper) * ONE, balance1: upper * ONE, price1Per0X18: ONE}, config);
+    const low = planRebalance({balance0: upper * ONE, balance1: (100000n - upper) * ONE, price1Per0X18: ONE}, config);
+    assert.equal(high.action, expected);
+    assert.equal(low.action, expected === "HOLD" ? "HOLD" : "BUY_TOKEN1");
+  }
+});
+
+test("gas_floor uses allocation error removed by the capped quote, including overshoot", () => {
+  const {input} = gasFloorChecks(ONE / 10n);
+  const gasFloor = {...input.gasFloor!, balance0: 45n * ONE / 100n, balance1: 55n * ONE / 100n};
+  // A 0.1 TT1 sale with a lossless quote crosses the target and leaves the
+  // same absolute error: a large input alone is no economic benefit.
+  const overshoot = evaluateRisk({...input, gasFloor});
+  assert.equal(overshoot.find(c => c.name === "gas_floor")!.passed, false);
+  const capped = {...input.plan, amountIn: ONE / 100n};
+  const improved = evaluateRisk({...input, plan: capped, gasFloor: {...gasFloor, quoteOut: capped.amountIn}});
+  assert.equal(improved.find(c => c.name === "gas_floor")!.passed, true);
+  const worseQuote = evaluateRisk({...input, plan: capped, gasFloor: {...gasFloor, quoteOut: 0n}});
+  assert.notEqual(improved.find(c => c.name === "gas_floor")!.detail, worseQuote.find(c => c.name === "gas_floor")!.detail);
+});
+
+test("whole-path calibration permits the band-edge gap and historical sell", () => {
+  const {input} = gasFloorChecks(8598n * ONE / 1000000n);
+  const pathCost = 46321n * 10n ** 9n + 141802n * 10n ** 9n + 35773n * 10n ** 9n;
+  assert.equal(pathCost, 223896n * 10n ** 9n);
+  const mark = 1724617n * ONE / 100000n;
+  const floor = {...input.gasFloor!, estimatedGasHsk: pathCost, token1PerWhskX18: mark};
+  const edge = evaluateRisk({...input, gasFloor: floor}).find(c => c.name === "gas_floor")!;
+  assert.equal(edge.passed, true);
+  assert.match(edge.detail, /minimum_value_quote=7722696956640000$/);
+  const historical = evaluateRisk({...input, plan: {...input.plan, amountIn: 86090351630377497n}, gasFloor: {
+    ...floor, balance0: 0n, balance1: 172180703260754993n,
+    price1Per0X18: 330861480906068668n, quoteOut: 259328888119975221n,
+  }});
+  assert.equal(historical.find(c => c.name === "gas_floor")!.passed, true);
+});
+
+test("gas_floor keeps fractional target error exact at sub-wei boundaries", () => {
+  const {input} = gasFloorChecks(1n);
+  const gasFloor = {...input.gasFloor!, balance0: 0n, balance1: 100n, quoteOut: 0n,
+    estimatedGasHsk: 1n, token1PerWhskX18: ONE, minGasMultiple: 1};
+  // Selling 1 wei with no output removes only half a wei from D at a 50% target.
+  assert.equal(evaluateRisk({...input, gasFloor}).find(c => c.name === "gas_floor")!.passed, false);
 });

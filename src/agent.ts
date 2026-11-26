@@ -8,10 +8,14 @@ import { ReserveError, submitWithReserve } from "./transactions.js";
 import { compileDecisionLog } from "./compile.js";
 import { appendJsonLine, loadState, restoreLedgerCooldown, saveState, utcDay, type AgentState } from "./persistence.js";
 import { assertTestnet, createRuntime, loadAuditDeployment, loadDecisionLogAddress, persistDeployment, type Runtime } from "./runtime.js";
-import { ABSOLUTE_MAX_SLIPPAGE_BPS, evaluateRisk, ONE, planRebalance, priceX18FromSqrtPrice, type Plan, type RiskCheck } from "./strategy.js";
+import { ABSOLUTE_MAX_SLIPPAGE_BPS, ceilDiv, evaluateRisk, FEE_DENOMINATOR, ONE, planRebalance, priceX18FromSqrtPrice, type Plan, type RiskCheck } from "./strategy.js";
 
 type Snapshot = {
   blockNumber: number;
+  blockHash: string;
+  observedAt: string;
+  native: bigint;
+  whskBalance: bigint;
   sqrtPriceX96: bigint;
   price1Per0X18: bigint;
   bootstrapSqrtPriceX96: bigint;
@@ -33,6 +37,9 @@ type SwapOutcome = {
   quoteOut: bigint;
   minOut: bigint;
   error?: string;
+  quoteAt?: string | null;
+  spotOut?: bigint;
+  pathCostHsk?: bigint;
 };
 
 export type DecisionRecord = ReturnType<typeof makeDecisionRecord>;
@@ -43,16 +50,15 @@ export async function preflight(): Promise<Record<string, unknown>> {
   const setup = await verifySetup(runtime);
   const snapshot = await readSnapshot(runtime);
   const state = await loadRiskState(runtime);
-  const plan = planRebalance(snapshot, config);
-  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now()));
+  const {plan, riskChecks, execution} = await assessRebalance(runtime, state, snapshot);
   const quoteAmount = parseUnits("0.01", 18);
-  const quoteOut = await quoteExactInput(runtime, config.token0, config.token1, quoteAmount, config.poolFee);
-  const bootstrapQuote = await quoteExactInput(runtime, config.whsk, config.bootstrapToken, quoteAmount, config.poolFee);
-  const native = await runtime.provider.getBalance(runtime.walletAddress);
+  const quoteOut = await quoteExactInput(runtime, config.token0, config.token1, quoteAmount, config.poolFee, snapshot.blockNumber);
+  const bootstrapQuote = await quoteExactInput(runtime, config.whsk, config.bootstrapToken, quoteAmount, config.poolFee, snapshot.blockNumber);
+  const native = snapshot.native;
   const [whskBalance, token0Balance, token1Balance] = await Promise.all([
-    new Contract(config.whsk, ERC20_ABI, runtime.provider).balanceOf(runtime.walletAddress) as Promise<bigint>,
-    new Contract(config.token0, ERC20_ABI, runtime.provider).balanceOf(runtime.walletAddress) as Promise<bigint>,
-    new Contract(config.token1, ERC20_ABI, runtime.provider).balanceOf(runtime.walletAddress) as Promise<bigint>,
+    new Contract(config.whsk, ERC20_ABI, runtime.provider).balanceOf(runtime.walletAddress, {blockTag: snapshot.blockNumber}) as Promise<bigint>,
+    new Contract(config.token0, ERC20_ABI, runtime.provider).balanceOf(runtime.walletAddress, {blockTag: snapshot.blockNumber}) as Promise<bigint>,
+    new Contract(config.token1, ERC20_ABI, runtime.provider).balanceOf(runtime.walletAddress, {blockTag: snapshot.blockNumber}) as Promise<bigint>,
   ]);
   let registryAddress: string | null = null;
   try {
@@ -77,6 +83,7 @@ export async function preflight(): Promise<Record<string, unknown>> {
     },
     pool: {
       blockNumber: snapshot.blockNumber,
+      blockHash: snapshot.blockHash,
       token0PerToken1: formatUnits(ONE * ONE / snapshot.price1Per0X18, 18),
       token1PerToken0: formatUnits(snapshot.price1Per0X18, 18),
       sqrtPriceX96: snapshot.sqrtPriceX96.toString(),
@@ -92,7 +99,8 @@ export async function preflight(): Promise<Record<string, unknown>> {
       token1PerWhsk: formatUnits(snapshot.token1PerWhskX18, 18),
       bootstrapSqrtPriceX96: snapshot.bootstrapSqrtPriceX96.toString(),
       estimatedGasHsk: formatUnits(config.estimatedGasHsk, 18),
-      estimatedGasCostToken1: formatUnits(config.estimatedGasHsk * snapshot.token1PerWhskX18 / ONE, 18),
+      expectedPathCostHsk: formatUnits(execution.pathCostHsk, 18),
+      estimatedGasCostToken1: formatUnits(ceilDiv(execution.pathCostHsk * snapshot.token1PerWhskX18, ONE), 18),
       minGasMultiple: config.minGasMultiple,
     },
     rebalance: {action: plan.action, amountIn: formatUnits(plan.amountIn, 18), constraints: riskChecks},
@@ -121,8 +129,7 @@ async function observeLocked(runtime: Runtime): Promise<Record<string, unknown>>
     state.dailyStartValueQuote = snapshot.valueQuote.toString();
     await saveState(config.statePath, state);
   }
-  const plan = planRebalance({balance0: snapshot.balance0, balance1: snapshot.balance1, price1Per0X18: snapshot.price1Per0X18}, config);
-  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now()));
+  const {plan, riskChecks, execution} = await assessRebalance(runtime, state, snapshot);
   const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, {
     status: "observed",
     swapTxHash: null,
@@ -130,8 +137,10 @@ async function observeLocked(runtime: Runtime): Promise<Record<string, unknown>>
     approvalTxHash: null,
     amountIn: 0n,
     amountOut: 0n,
-    quoteOut: 0n,
-    minOut: 0n,
+    quoteOut: execution.quoteOut,
+    minOut: execution.minOut,
+    quoteAt: execution.quoteAt,
+    spotOut: execution.spotOut, pathCostHsk: execution.pathCostHsk,
   });
   await appendJsonLine(config.logPath, record);
   return record;
@@ -272,13 +281,13 @@ async function runCycleLocked(runtime: Runtime, bootstrapPool?: string): Promise
   if (state.bootstrapBaselinePending) throw new Error("Awaiting positive bootstrap baseline; refusing to trade");
   const setupPool = bootstrapPool ?? (await verifySetup(runtime)).bootstrapPool;
   const snapshot = await readSnapshot(runtime);
-  const balancesEmpty = snapshot.balance0 === 0n && snapshot.balance1 === 0n;
+  const bootstrapEligible = !state.bootstrapComplete && snapshot.valueQuote < config.minTradableNotionalQuote;
 
-  if (!state.bootstrapComplete && balancesEmpty) {
+  if (bootstrapEligible) {
     await bootstrap(runtime, setupPool, snapshot, state);
     return;
   }
-  if (!state.bootstrapComplete && !balancesEmpty) {
+  if (!state.bootstrapComplete) {
     state.bootstrapComplete = true;
   }
   if (state.dailyStartValueQuote === null && snapshot.valueQuote > 0n) {
@@ -286,8 +295,7 @@ async function runCycleLocked(runtime: Runtime, bootstrapPool?: string): Promise
   }
   await saveState(config.statePath, state);
 
-  const plan = planRebalance({balance0: snapshot.balance0, balance1: snapshot.balance1, price1Per0X18: snapshot.price1Per0X18}, config);
-  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now()));
+  const {plan, riskChecks, execution} = await assessRebalance(runtime, state, snapshot);
   if (plan.action === "HOLD" || riskChecks.some((check) => !check.passed)) {
     const status = plan.action === "HOLD" ? "no_trade" : "risk_blocked";
     const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, {
@@ -297,8 +305,10 @@ async function runCycleLocked(runtime: Runtime, bootstrapPool?: string): Promise
       approvalTxHash: null,
       amountIn: 0n,
       amountOut: 0n,
-      quoteOut: 0n,
-      minOut: 0n,
+      quoteOut: execution.quoteOut,
+      minOut: execution.minOut,
+      quoteAt: execution.quoteAt,
+      spotOut: execution.spotOut, pathCostHsk: execution.pathCostHsk,
     });
     await appendJsonLine(config.logPath, record);
     console.log(JSON.stringify({timestamp: record.timestamp, status, action: plan.action, reason: plan.reason}));
@@ -307,38 +317,35 @@ async function runCycleLocked(runtime: Runtime, bootstrapPool?: string): Promise
 
   const tokenIn = plan.tokenInIndex === 0 ? config.token0 : config.token1;
   const tokenOut = plan.tokenInIndex === 0 ? config.token1 : config.token0;
-  const record = await executeSwap(runtime, state, {snapshot, tokenIn, tokenOut, plan, riskChecks});
+  const record = await executeSwap(runtime, state, {snapshot, tokenIn, tokenOut, plan, riskChecks, execution});
   console.log(JSON.stringify({timestamp: record.timestamp, status: record.execution.status, action: plan.action, txHash: record.execution.swapTxHash, reason: plan.reason}));
 }
 
 async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapshot, state: AgentState): Promise<Record<string, unknown>> {
   const {config, wallet, walletAddress} = runtime;
   const now = Date.now();
-  const native = await runtime.provider.getBalance(walletAddress);
+  const native = snapshot.native;
   const whsk = new Contract(config.whsk, WHSK_ABI, wallet);
-  const whskToken = new Contract(config.whsk, ERC20_ABI, runtime.provider);
-  const token1 = new Contract(config.bootstrapToken, ERC20_ABI, runtime.provider);
-  const [whskBalance, token1Balance, quoteOut] = await Promise.all([
-    whskToken.balanceOf(walletAddress) as Promise<bigint>,
-    token1.balanceOf(walletAddress) as Promise<bigint>,
-    quoteExactInput(runtime, config.whsk, config.bootstrapToken, config.bootstrapHsk, config.poolFee),
-  ]);
-  if (token1Balance > 0n || snapshot.balance0 > 0n || snapshot.balance1 > 0n) {
+  const whskBalance = snapshot.whskBalance;
+  if (state.bootstrapComplete || snapshot.valueQuote >= config.minTradableNotionalQuote) {
     state.bootstrapComplete = true;
     await saveState(config.statePath, state);
     return {status: "bootstrap_not_needed", wallet: walletAddress};
   }
+  const quoteOut = await quoteExactInput(runtime, config.whsk, config.bootstrapToken, config.bootstrapHsk, config.poolFee, snapshot.blockNumber);
+  const quoteAt = new Date(Date.now()).toISOString();
+  const hold = (reason: string, riskChecks: RiskCheck[] = []) => recordBootstrapHold(runtime, snapshot, state, reason, riskChecks, quoteOut, quoteAt);
 
-  const bootstrapPoolLiquidity = BigInt(await new Contract(poolAddress, POOL_ABI, runtime.provider).liquidity());
+  const bootstrapPoolLiquidity = BigInt(await new Contract(poolAddress, POOL_ABI, runtime.provider).liquidity({blockTag: snapshot.blockNumber}));
   if (bootstrapPoolLiquidity === 0n || quoteOut === 0n) {
-    return recordBootstrapHold(runtime, snapshot, state, "The WHSK/TT1 bootstrap pool cannot return a nonzero quote.");
+    return hold("The WHSK/TT1 bootstrap pool cannot return a nonzero quote.");
   }
-  const bootstrapValueQuote = quoteOut;
+  const bootstrapValueQuote = snapshot.balance1 + quoteOut;
   if (bootstrapValueQuote > config.maxPositionQuote) {
-    return recordBootstrapHold(runtime, snapshot, state, "The bootstrap quote exceeds the configured maximum position.");
+    return hold("The bootstrap quote exceeds the configured maximum position.");
   }
   if (native < config.hskGasReserve) {
-    return recordBootstrapHold(runtime, snapshot, state, "Native HSK is below the configured gas reserve.");
+    return hold("Native HSK is below the configured gas reserve.");
   }
   const amountIn = config.bootstrapHsk;
   const plan: Plan = {
@@ -349,7 +356,7 @@ async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapsh
     targetToken1ValueQuote: bootstrapValueQuote,
     currentToken1WeightBps: 0,
     deviationBps: -config.targetToken1Bps,
-    reason: "Wallet has no TT1/TT2 inventory; buy a capped TT1 seed from the on-chain WHSK/TT1 pool to start autonomous rebalancing.",
+    reason: "Initial inventory is below the minimum tradable notional; buy a capped TT1 seed from the on-chain WHSK/TT1 pool to start autonomous rebalancing.",
   };
   const riskChecks = evaluateRisk({
     plan,
@@ -366,20 +373,20 @@ async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapsh
     // gas_floor applies only to rebalancing; bootstrap must seed inventory.
   });
   if (riskChecks.some((check) => !check.passed)) {
-    return recordBootstrapHold(runtime, snapshot, state, "A bootstrap risk constraint failed.", riskChecks);
+    return hold("A bootstrap risk constraint failed.", riskChecks);
   }
 
   if (whskBalance < amountIn) {
     const needed = amountIn - whskBalance;
     if (native < needed + config.hskGasReserve) {
-      return recordBootstrapHold(runtime, snapshot, state, "Insufficient HSK for the configured WHSK seed plus the native gas reserve.", riskChecks);
+      return hold("Insufficient HSK for the configured WHSK seed plus the native gas reserve.", riskChecks);
     }
     const request = await whsk.deposit.populateTransaction({value: needed});
     let wrapTx;
     try {
       wrapTx = await submitWithReserve(runtime, request);
     } catch (error) {
-      if (error instanceof ReserveError) return recordBootstrapHold(runtime, snapshot, state, error.message, riskChecks);
+      if (error instanceof ReserveError) return hold(error.message, riskChecks);
       throw error;
     }
     const wrapReceipt = await wrapTx.wait();
@@ -395,18 +402,18 @@ async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapsh
     });
   }
 
-  const bootstrapPool = new Contract(poolAddress, POOL_ABI, runtime.provider);
-  const bootstrapSlot = await bootstrapPool.slot0();
-  const priceX96 = BigInt(bootstrapSlot[0]);
+  // Wrapping changes balances and can advance the chain; execution gets a fresh
+  // pinned observation while retaining the dust-provisioning disclosure.
+  const executionSnapshot = whskBalance < amountIn ? await readSnapshot(runtime) : snapshot;
   const record = await executeSwap(runtime, state, {
-    snapshot, tokenIn: config.whsk, tokenOut: config.bootstrapToken, plan, riskChecks,
-    bootstrapPool: poolAddress, priceX96,
+    snapshot: executionSnapshot, tokenIn: config.whsk, tokenOut: config.bootstrapToken, plan, riskChecks,
+    bootstrapPool: poolAddress,
   });
   console.log(JSON.stringify({timestamp: record.timestamp, status: record.execution.status, action: "BOOTSTRAP", txHash: record.execution.swapTxHash}));
   return record;
 }
 
-async function recordBootstrapHold(runtime: Runtime, snapshot: Snapshot, state: AgentState, reason: string, riskChecks: RiskCheck[] = []): Promise<Record<string, unknown>> {
+async function recordBootstrapHold(runtime: Runtime, snapshot: Snapshot, state: AgentState, reason: string, riskChecks: RiskCheck[] = [], quoteOut = 0n, quoteAt: string | null = null): Promise<Record<string, unknown>> {
   const plan: Plan = {
     action: "HOLD", amountIn: 0n, tokenInIndex: null, totalValueQuote: snapshot.valueQuote,
     targetToken1ValueQuote: 0n, currentToken1WeightBps: 0, deviationBps: 0, reason,
@@ -418,7 +425,8 @@ async function recordBootstrapHold(runtime: Runtime, snapshot: Snapshot, state: 
     approvalTxHash: null,
     amountIn: 0n,
     amountOut: 0n,
-    quoteOut: 0n,
+    quoteOut,
+    quoteAt,
     minOut: 0n,
   }, "BOOTSTRAP");
   await appendJsonLine(runtime.config.logPath, record);
@@ -427,18 +435,90 @@ async function recordBootstrapHold(runtime: Runtime, snapshot: Snapshot, state: 
   return record;
 }
 
+type ExecutionQuote = {
+  quoteOut: bigint;
+  quoteAt: string | null;
+  spotOut: bigint;
+  minOut: bigint;
+  allowance: bigint;
+  pathCostHsk: bigint;
+};
+
+async function readExecutionQuote(runtime: Runtime, snapshot: Snapshot, plan: Plan, tokenIn: string, tokenOut: string, bootstrap = false): Promise<ExecutionQuote> {
+  const {config, provider, walletAddress} = runtime;
+  const [quoteOut, allowance] = plan.action === "HOLD" ? [0n, 0n] : await Promise.all([
+    quoteExactInput(runtime, tokenIn, tokenOut, plan.amountIn, config.poolFee, snapshot.blockNumber),
+    new Contract(tokenIn, ERC20_ABI, provider).allowance(walletAddress, config.router, {blockTag: snapshot.blockNumber}) as Promise<bigint>,
+  ]);
+  const feeFactor = FEE_DENOMINATOR - BigInt(config.poolFee);
+  const spotOut = bootstrap
+    ? plan.amountIn * feeFactor * snapshot.token1PerWhskX18 / (FEE_DENOMINATOR * ONE)
+    : plan.tokenInIndex === 0
+      ? plan.amountIn * feeFactor * snapshot.price1Per0X18 / (FEE_DENOMINATOR * ONE)
+      : plan.amountIn * feeFactor * ONE / (FEE_DENOMINATOR * snapshot.price1Per0X18);
+  const factor = BigInt(10000 - config.maxSlippageBps);
+  const quoteMinimum = ceilDiv(quoteOut * factor, 10000n);
+  const spotMinimum = ceilDiv(spotOut * factor, 10000n);
+  return {
+    quoteOut, quoteAt: plan.action === "HOLD" ? null : new Date(Date.now()).toISOString(), spotOut,
+    minOut: quoteMinimum > spotMinimum ? quoteMinimum : spotMinimum,
+    allowance: BigInt(allowance),
+    pathCostHsk: config.estimatedGasHsk + config.estimatedRegistryGasHsk
+      + (allowance < plan.amountIn ? config.estimatedApprovalGasHsk : 0n),
+  };
+}
+
+function executionChecks(snapshot: Snapshot, plan: Plan, execution: ExecutionQuote): RiskCheck[] {
+  return [
+    {name: "spot_quote_floor", passed: plan.action === "HOLD" || (execution.quoteOut > 0n && execution.quoteOut >= execution.minOut),
+      detail: `quote=${execution.quoteOut}; fee_adjusted_spot=${execution.spotOut}; minimum=${execution.minOut}`},
+    {name: "pool_liquidity", passed: plan.action === "HOLD" || snapshot.liquidity > 0n, detail: `liquidity=${snapshot.liquidity}`},
+  ];
+}
+
+async function assessRebalance(runtime: Runtime, state: AgentState, snapshot: Snapshot) {
+  const {config} = runtime;
+  const plan = planRebalance(snapshot, config);
+  const tokenIn = plan.tokenInIndex === 0 ? config.token0 : config.token1;
+  const tokenOut = plan.tokenInIndex === 0 ? config.token1 : config.token0;
+  const execution = await readExecutionQuote(runtime, snapshot, plan, tokenIn, tokenOut);
+  const riskChecks = [...evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now(), execution)),
+    ...executionChecks(snapshot, plan, execution)];
+  return {plan, riskChecks, execution};
+}
+
+async function assessBootstrap(runtime: Runtime, state: AgentState, snapshot: Snapshot, originalPlan: Plan) {
+  const {config} = runtime;
+  const execution = await readExecutionQuote(runtime, snapshot, originalPlan, config.whsk, config.bootstrapToken, true);
+  const position = snapshot.balance1 + execution.quoteOut;
+  const plan = {...originalPlan, totalValueQuote: snapshot.valueQuote + execution.quoteOut, targetToken1ValueQuote: position};
+  const {gasFloor, ...riskInput} = makeRiskInput(config, state, plan, snapshot, Date.now(), execution);
+  const liquidity = BigInt(await new Contract(config.bootstrapPool, POOL_ABI, runtime.provider).liquidity({blockTag: snapshot.blockNumber}));
+  const riskChecks = [...evaluateRisk({...riskInput, dailyStartValueQuote: null}),
+    ...executionChecks({...snapshot, liquidity}, plan, execution),
+    {name: "initial_provisioning", passed: !state.bootstrapComplete && snapshot.valueQuote < config.minTradableNotionalQuote,
+      detail: `value=${snapshot.valueQuote}; minimum_tradable_notional=${config.minTradableNotionalQuote}; seeded=${state.bootstrapComplete}`},
+  ];
+  return {plan, riskChecks, execution};
+}
+
 async function executeSwap(runtime: Runtime, state: AgentState, input: {
   snapshot: Snapshot;
   tokenIn: string;
   tokenOut: string;
   plan: Plan;
   riskChecks: RiskCheck[];
-  priceX96?: bigint;
+  execution?: ExecutionQuote;
   bootstrapPool?: string;
 }): Promise<DecisionRecord> {
   const {config, provider, wallet, walletAddress} = runtime;
-  const {plan, riskChecks, snapshot} = input;
-  const {amountIn} = plan;
+  let {plan, riskChecks, snapshot} = input;
+  let execution: ExecutionQuote;
+  if (input.bootstrapPool) {
+    ({plan, riskChecks, execution} = await assessBootstrap(runtime, state, snapshot, plan));
+  } else {
+    execution = input.execution!;
+  }
   const registryAddress = await requireDecisionLog(runtime);
   const codes = await Promise.all([input.tokenIn, input.tokenOut, config.router].map(address => provider.getCode(address)));
   if (codes.some(code => code === "0x")) throw new Error("Swap preflight found a configured address without testnet contract code");
@@ -447,44 +527,63 @@ async function executeSwap(runtime: Runtime, state: AgentState, input: {
     if (getAddress(pool) !== getAddress(input.bootstrapPool)) throw new Error("Bootstrap pool does not match the configured testnet factory result");
   }
 
-  const quoteOut = await quoteExactInput(runtime, input.tokenIn, input.tokenOut, amountIn, config.poolFee);
-  if (quoteOut <= 0n) throw new Error("Quoter returned zero output; refusing to swap");
-  const minOut = (quoteOut * BigInt(10000 - config.maxSlippageBps)) / 10000n;
-  const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, {
-    status: "swap_submitted", swapTxHash: null, registryTxHash: null, decisionLogAddress: registryAddress,
-    approvalTxHash: null, amountIn: 0n, amountOut: 0n, quoteOut, minOut,
-  }, input.bootstrapPool ? "BOOTSTRAP" : "REBALANCE", input.priceX96);
-
+  function decisionRecord() {
+    return makeDecisionRecord(runtime, snapshot, plan, riskChecks, {
+      status: "swap_submitted", swapTxHash: null, registryTxHash: null, decisionLogAddress: registryAddress,
+      approvalTxHash: null, amountIn: 0n, amountOut: 0n, quoteOut: execution.quoteOut, minOut: execution.minOut, quoteAt: execution.quoteAt,
+      spotOut: execution.spotOut, pathCostHsk: execution.pathCostHsk,
+    }, input.bootstrapPool ? "BOOTSTRAP" : "REBALANCE", input.bootstrapPool ? snapshot.bootstrapSqrtPriceX96 : snapshot.sqrtPriceX96);
+  }
+  let record = decisionRecord();
   async function blocked(reason: string) {
     record.execution.status = input.bootstrapPool ? "bootstrap_blocked" : "risk_blocked";
     record.execution.error = reason;
     await appendJsonLine(config.logPath, record);
     return record;
   }
+  if (riskChecks.some(check => !check.passed)) return blocked("An execution risk constraint failed.");
 
-  if (input.bootstrapPool && quoteOut > config.maxPositionQuote) {
-    const detail = `Bootstrap execution quote ${quoteOut} exceeds the TT1 position cap ${config.maxPositionQuote}`;
-    record.constraints = riskChecks.map(check => check.name === "max_position_size" ? {...check, passed: false, detail} : check);
-    return blocked(detail);
-  }
-  const token = new Contract(input.tokenIn, ERC20_ABI, wallet);
-  const balance = BigInt(await token.balanceOf(walletAddress));
-  if (balance < amountIn) throw new Error("Insufficient token input balance for planned trade");
-
-  const allowance = BigInt(await token.allowance(walletAddress, config.router));
-  const router = new Contract(config.router, ROUTER_ABI, wallet);
-  const request = await router.exactInputSingle.populateTransaction({
-    tokenIn: input.tokenIn, tokenOut: input.tokenOut, fee: config.poolFee,
-    recipient: walletAddress, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0,
-  });
   let swap;
   try {
-    if (allowance < amountIn) {
-      const approval = await submitWithReserve(runtime, await token.approve.populateTransaction(config.router, amountIn));
+    if (execution.allowance < plan.amountIn) {
+      const original = {blockNumber: snapshot.blockNumber, blockHash: snapshot.blockHash, observedAt: snapshot.observedAt,
+        amountIn: plan.amountIn, tokenIn: input.tokenIn, minOut: execution.minOut, pathCostHsk: execution.pathCostHsk};
+      const token = new Contract(input.tokenIn, ERC20_ABI, wallet);
+      const approval = await submitWithReserve(runtime, await token.approve.populateTransaction(config.router, plan.amountIn));
       const receipt = await approval.wait();
       if (!receipt || receipt.status !== 1) throw new Error("Exact token approval failed");
       record.execution.approvalTxHash = approval.hash;
+      try {
+        snapshot = await readSnapshot(runtime);
+        ({plan, riskChecks, execution} = input.bootstrapPool
+          ? await assessBootstrap(runtime, state, snapshot, plan)
+          : await assessRebalance(runtime, state, snapshot));
+      } catch (error) {
+        return blocked(`Post-approval revalidation failed: ${errorMessage(error)}`);
+      }
+      const refreshedTokenIn = input.bootstrapPool ? config.whsk : plan.tokenInIndex === 0 ? config.token0 : config.token1;
+      if (original.tokenIn === refreshedTokenIn && original.amountIn === plan.amountIn) {
+        if (original.minOut > execution.minOut) execution.minOut = original.minOut;
+      }
+      riskChecks.push({name: "approval_quote_floor", passed: execution.quoteOut >= execution.minOut,
+        detail: `refreshed_quote=${execution.quoteOut}; minimum=${execution.minOut}`});
+      record = decisionRecord();
+      record.execution.approvalTxHash = approval.hash;
+      record.approvalRevalidation = {originalBlockNumber: original.blockNumber, originalBlockHash: original.blockHash,
+        originalObservedAt: original.observedAt, originalMinimumOut: formatUnits(original.minOut, 18),
+        originalExpectedPathCostHsk: formatUnits(original.pathCostHsk, 18)};
+      if (execution.quoteOut < execution.minOut) return blocked("Post-approval refreshed quote is below the preserved minimum output.");
+      if (plan.action === "HOLD" || riskChecks.some(check => !check.passed)) return blocked("Post-approval plan is HOLD or failed a risk constraint.");
+      if (refreshedTokenIn !== input.tokenIn || execution.allowance < plan.amountIn) {
+        return blocked("Post-approval refreshed plan requires a different input token or another approval.");
+      }
     }
+    const balance = input.bootstrapPool ? snapshot.whskBalance : plan.tokenInIndex === 0 ? snapshot.balance0 : snapshot.balance1;
+    if (balance < plan.amountIn) return blocked("Insufficient token input balance for planned trade");
+    const request = await new Contract(config.router, ROUTER_ABI, wallet).exactInputSingle.populateTransaction({
+      tokenIn: input.tokenIn, tokenOut: input.tokenOut, fee: config.poolFee,
+      recipient: walletAddress, amountIn: plan.amountIn, amountOutMinimum: execution.minOut, sqrtPriceLimitX96: 0,
+    });
     swap = await submitWithReserve(runtime, request, async hash => {
       record.execution.swapTxHash = hash;
       state.pendingSwap = {tokenIn: getAddress(input.tokenIn), tokenOut: getAddress(input.tokenOut),
@@ -544,14 +643,20 @@ async function readSnapshot(runtime: Runtime): Promise<Snapshot> {
   const {config, provider, walletAddress} = runtime;
   const pool = new Contract(config.pool, POOL_ABI, provider);
   const bootstrapPool = new Contract(config.bootstrapPool, POOL_ABI, provider);
-  const [slot0, liquidity, balance0, balance1, blockNumber, bootstrapSlot0, bootstrapToken0] = await Promise.all([
-    pool.slot0(),
-    pool.liquidity() as Promise<bigint>,
-    new Contract(config.token0, ERC20_ABI, provider).balanceOf(walletAddress) as Promise<bigint>,
-    new Contract(config.token1, ERC20_ABI, provider).balanceOf(walletAddress) as Promise<bigint>,
-    provider.getBlockNumber(),
-    bootstrapPool.slot0(),
-    bootstrapPool.token0() as Promise<string>,
+  const block = await provider.getBlock("latest");
+  if (!block || !block.hash) throw new Error("Decision block is unavailable");
+  const observedAt = new Date(Date.now()).toISOString();
+  const blockNumber = block.number;
+  const overrides = {blockTag: blockNumber};
+  const [slot0, liquidity, balance0, balance1, bootstrapSlot0, bootstrapToken0, native, whskBalance] = await Promise.all([
+    pool.slot0(overrides),
+    pool.liquidity(overrides) as Promise<bigint>,
+    new Contract(config.token0, ERC20_ABI, provider).balanceOf(walletAddress, overrides) as Promise<bigint>,
+    new Contract(config.token1, ERC20_ABI, provider).balanceOf(walletAddress, overrides) as Promise<bigint>,
+    bootstrapPool.slot0(overrides),
+    bootstrapPool.token0(overrides) as Promise<string>,
+    provider.getBalance(walletAddress, blockNumber),
+    new Contract(config.whsk, ERC20_ABI, provider).balanceOf(walletAddress, overrides) as Promise<bigint>,
   ]);
   const sqrtPriceX96 = BigInt(slot0[0]);
   const price1Per0X18 = priceX18FromSqrtPrice(sqrtPriceX96);
@@ -563,13 +668,13 @@ async function readSnapshot(runtime: Runtime): Promise<Snapshot> {
     ? bootstrapPriceX18 : ONE * ONE / bootstrapPriceX18;
   if (token1PerWhskX18 <= 0n) throw new Error("TT1/WHSK price must be positive");
   const valueQuote = (BigInt(balance0) * price1Per0X18) / ONE + BigInt(balance1);
-  return {blockNumber, sqrtPriceX96, price1Per0X18, bootstrapSqrtPriceX96, token1PerWhskX18, liquidity: BigInt(liquidity), balance0: BigInt(balance0), balance1: BigInt(balance1), valueQuote};
+  return {blockNumber, blockHash: block.hash, observedAt, native, whskBalance, sqrtPriceX96, price1Per0X18, bootstrapSqrtPriceX96, token1PerWhskX18, liquidity: BigInt(liquidity), balance0: BigInt(balance0), balance1: BigInt(balance1), valueQuote};
 }
 
-async function quoteExactInput(runtime: Runtime, tokenIn: string, tokenOut: string, amountIn: bigint, fee: number): Promise<bigint> {
+async function quoteExactInput(runtime: Runtime, tokenIn: string, tokenOut: string, amountIn: bigint, fee: number, blockTag: number): Promise<bigint> {
   const quoter = new Contract(runtime.config.quoter, QUOTER_V2_ABI, runtime.provider);
   const quoteMethod = quoter.getFunction("quoteExactInputSingle");
-  const result = await quoteMethod.staticCall({tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0});
+  const result = await quoteMethod.staticCall({tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0}, {blockTag});
   return BigInt(result[0]);
 }
 
@@ -579,7 +684,7 @@ async function requireDecisionLog(runtime: Runtime): Promise<string> {
   return address;
 }
 
-function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, snapshot: Snapshot, nowMs: number) {
+function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, snapshot: Snapshot, nowMs: number, execution: ExecutionQuote) {
   return {
     plan,
     maxTradeInput: config.maxTradeInput,
@@ -593,9 +698,13 @@ function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, snaps
     dailyStartValueQuote: state.dailyStartValueQuote === null ? null : BigInt(state.dailyStartValueQuote),
     maxDailyLossBps: config.maxDailyLossBps,
     gasFloor: {
+      balance0: snapshot.balance0,
+      balance1: snapshot.balance1,
+      targetToken1Bps: config.targetToken1Bps,
+      quoteOut: execution.quoteOut,
       price1Per0X18: snapshot.price1Per0X18,
       token1PerWhskX18: snapshot.token1PerWhskX18,
-      estimatedGasHsk: config.estimatedGasHsk,
+      estimatedGasHsk: execution.pathCostHsk,
       minGasMultiple: config.minGasMultiple,
     },
   };
@@ -603,8 +712,26 @@ function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, snaps
 
 function makeDecisionRecord(runtime: Runtime, snapshot: Snapshot, plan: Plan, riskChecks: RiskCheck[], outcome: SwapOutcome, kind = "REBALANCE", priceX96 = snapshot.sqrtPriceX96) {
   return {
-    timestamp: new Date().toISOString(),
+    timestamp: snapshot.observedAt,
+    observedAt: snapshot.observedAt,
+    quoteAt: outcome.quoteAt ?? null,
+    fillAt: null as string | null,
     blockNumber: snapshot.blockNumber,
+    blockHash: snapshot.blockHash,
+    policy: {
+      hskGasReserve: formatUnits(runtime.config.hskGasReserve, 18),
+      targetToken1Bps: runtime.config.targetToken1Bps, rebalanceBandBps: runtime.config.rebalanceBandBps,
+      maxSlippageBps: runtime.config.maxSlippageBps, poolFee: runtime.config.poolFee,
+      maxTradeInput: formatUnits(runtime.config.maxTradeInput, 18), maxPositionQuote: formatUnits(runtime.config.maxPositionQuote, 18),
+      minTradeIntervalMs: runtime.config.minTradeIntervalMs, maxDailyLossBps: runtime.config.maxDailyLossBps,
+      minGasMultiple: runtime.config.minGasMultiple,
+      estimatedSwapGasHsk: formatUnits(runtime.config.estimatedGasHsk, 18),
+      estimatedApprovalGasHsk: formatUnits(runtime.config.estimatedApprovalGasHsk, 18),
+      estimatedRegistryGasHsk: formatUnits(runtime.config.estimatedRegistryGasHsk, 18),
+    },
+    approvalRevalidation: null as {originalBlockNumber: number; originalBlockHash: string; originalObservedAt: string; originalMinimumOut: string; originalExpectedPathCostHsk: string} | null,
+    bootstrap: {minimumTradableNotionalQuote: formatUnits(runtime.config.minTradableNotionalQuote, 18),
+      dustRuleFired: kind === "BOOTSTRAP" && snapshot.valueQuote > 0n && snapshot.valueQuote < runtime.config.minTradableNotionalQuote},
     chainId: 133,
     wallet: runtime.walletAddress,
     addresses: {factory: runtime.config.factory, router: runtime.config.router, quoter: runtime.config.quoter, pool: runtime.config.pool, token0: runtime.config.token0, token1: runtime.config.token1},
@@ -612,13 +739,16 @@ function makeDecisionRecord(runtime: Runtime, snapshot: Snapshot, plan: Plan, ri
       token1PerToken0: formatUnits(snapshot.price1Per0X18, 18), sqrtPriceX96: snapshot.sqrtPriceX96.toString(),
       token1PerWhsk: formatUnits(snapshot.token1PerWhskX18, 18), bootstrapSqrtPriceX96: snapshot.bootstrapSqrtPriceX96.toString(),
     },
-    balances: {token0: formatUnits(snapshot.balance0, 18), token1: formatUnits(snapshot.balance1, 18), totalValueInToken1: formatUnits(snapshot.valueQuote, 18)},
+    balances: {token0: formatUnits(snapshot.balance0, 18), token1: formatUnits(snapshot.balance1, 18), totalValueInToken1: formatUnits(snapshot.valueQuote, 18),
+      nativeHsk: formatUnits(snapshot.native, 18), whsk: formatUnits(snapshot.whskBalance, 18)},
     signals: {targetToken1Bps: runtime.config.targetToken1Bps, currentToken1WeightBps: plan.currentToken1WeightBps, deviationBps: plan.deviationBps},
     plan: {kind, action: plan.action, amountIn: formatUnits(plan.amountIn, 18), amountInRaw: plan.amountIn.toString(), reason: plan.reason},
     constraints: riskChecks,
     execution: {
       status: outcome.status,
       quoteOut: formatUnits(outcome.quoteOut, 18),
+      feeAdjustedSpotOut: outcome.spotOut === undefined ? null : formatUnits(outcome.spotOut, 18),
+      expectedPathCostHsk: outcome.pathCostHsk === undefined ? null : formatUnits(outcome.pathCostHsk, 18),
       minimumOut: formatUnits(outcome.minOut, 18),
       amountIn: outcome.amountIn === null ? null : formatUnits(outcome.amountIn, 18),
       amountOut: outcome.amountOut === null ? null : formatUnits(outcome.amountOut, 18),

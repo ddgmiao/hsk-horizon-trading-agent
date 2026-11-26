@@ -24,6 +24,9 @@ const DEFAULTS = {
   minGasMultiple: 2,
   // Above the measured maximum routine transaction gas of 0.000142 HSK.
   estimatedGasHsk: "0.00015",
+  estimatedApprovalGasHsk: "0.000046321",
+  estimatedRegistryGasHsk: "0.000035773",
+  minTradableNotionalQuote: "0.01",
   bootstrapHsk: "0.01",
   // Measured session gas: 0.000300 HSK for the one-off contract deployment and 0.000036-0.000142 HSK per routine transaction; 0.02 HSK still leaves trade budget after the 0.1 HSK drip.
   hskGasReserve: "0.02",
@@ -53,6 +56,9 @@ export interface AgentConfig {
   maxDailyLossBps: number;
   minGasMultiple: number;
   estimatedGasHsk: bigint;
+  estimatedApprovalGasHsk: bigint;
+  estimatedRegistryGasHsk: bigint;
+  minTradableNotionalQuote: bigint;
   bootstrapHsk: bigint;
   hskGasReserve: bigint;
   pollSeconds: number;
@@ -131,6 +137,9 @@ export function loadConfig(): AgentConfig {
     maxDailyLossBps: intEnv("HSK_MAX_DAILY_LOSS_BPS", DEFAULTS.maxDailyLossBps, 1, 10000),
     minGasMultiple,
     estimatedGasHsk,
+    estimatedApprovalGasHsk: positiveAmountEnv("HSK_ESTIMATED_APPROVAL_GAS_HSK", DEFAULTS.estimatedApprovalGasHsk),
+    estimatedRegistryGasHsk: positiveAmountEnv("HSK_ESTIMATED_REGISTRY_GAS_HSK", DEFAULTS.estimatedRegistryGasHsk),
+    minTradableNotionalQuote: positiveAmountEnv("HSK_MIN_TRADABLE_NOTIONAL_QUOTE", DEFAULTS.minTradableNotionalQuote, null),
     bootstrapHsk,
     hskGasReserve: amountEnv("HSK_HSK_GAS_RESERVE", DEFAULTS.hskGasReserve),
     pollSeconds: intEnv("HSK_POLL_SECONDS", DEFAULTS.pollSeconds, 1, 3600),
@@ -138,4 +147,10 @@ export function loadConfig(): AgentConfig {
     logPath: process.env.HSK_LOG_PATH || "logs/decisions.jsonl",
     statePath: process.env.HSK_STATE_PATH || ".runtime/agent-state.json",
   };
+}
+
+function positiveAmountEnv(name: string, fallback: string, maximum: bigint | null = ONE): bigint {
+  const value = amountEnv(name, fallback);
+  if (value <= 0n || (maximum !== null && value > maximum)) throw new Error(`${name} must be greater than zero${maximum === null ? "" : " and at most 1"}`);
+  return value;
 }

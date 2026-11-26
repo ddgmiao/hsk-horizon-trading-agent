@@ -180,7 +180,8 @@ export function isFill(record: DecisionRecord): boolean {
 export async function restoreLedgerCooldown(path: string, state: AgentState): Promise<void> {
   for (const row of (await readLedger(path)).records) {
     if (row.wallet?.toLowerCase() === state.wallet.toLowerCase() && isFill(row)) {
-      const time = Date.parse(row.timestamp);
+      if (row.plan?.kind === "BOOTSTRAP") state.bootstrapComplete = true;
+      const time = Date.parse(row.fillAt ?? row.timestamp);
       if (!Number.isSafeInteger(time) || time < 0) throw new Error("Invalid fill time in ledger; refusing to trade");
       state.lastTradeAtMs = Math.max(state.lastTradeAtMs ?? 0, time);
     }

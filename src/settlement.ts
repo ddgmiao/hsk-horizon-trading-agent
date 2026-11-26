@@ -59,7 +59,7 @@ async function recordOnChain(runtime: Runtime, state: AgentState, record: Decisi
   const pending = state.pendingSwap!;
   const registry = new Contract(execution.decisionLogAddress!, DECISION_LOG_ABI, runtime.wallet);
   if (!pending.registryCall) {
-    const timestamp = Math.floor(Date.parse(record.timestamp) / 1000);
+    const timestamp = Math.floor(Date.parse(record.observedAt ?? record.timestamp) / 1000);
     const actionCode = record.plan.kind === "BOOTSTRAP" ? 3 : record.plan.action === "BUY_TOKEN1" ? 1 : 2;
     pending.registryCall = {args: [
       id(`${record.wallet}:${execution.swapTxHash}:${timestamp}`), String(timestamp), String(record.signals.deviationBps),
@@ -120,7 +120,7 @@ export async function reconcilePendingSwap(runtime: Runtime, state: AgentState, 
     const existing = await findSwapRecord(logPath, record.wallet, hash);
     if (existing) {
       if (isFill(existing)) {
-        state.lastTradeAtMs = Math.max(state.lastTradeAtMs ?? 0, Date.parse(existing.timestamp));
+        state.lastTradeAtMs = Math.max(state.lastTradeAtMs ?? 0, Date.parse(existing.fillAt ?? existing.timestamp));
         if (existing.plan.kind === "BOOTSTRAP") {
           state.bootstrapComplete = true;
           if (state.dailyStartValueQuote === null) state.bootstrapBaselinePending = true;
@@ -144,7 +144,11 @@ export async function reconcilePendingSwap(runtime: Runtime, state: AgentState, 
       if (!block) throw new Error(`Awaiting block timestamp for swap ${hash}`);
       const fillTime = block.timestamp * 1000;
       state.lastTradeAtMs = Math.max(state.lastTradeAtMs ?? 0, fillTime);
-      record.timestamp = new Date(fillTime).toISOString();
+      record.observedAt ??= record.timestamp;
+      record.fillAt = new Date(fillTime).toISOString();
+      // Keep the legacy timestamp as a fill-time alias for existing consumers.
+      // observedAt remains the signal time used by the registry.
+      record.timestamp = record.fillAt;
       if (record.plan.kind === "BOOTSTRAP") {
         state.bootstrapComplete = true;
         state.bootstrapBaselinePending = true;
@@ -202,10 +206,13 @@ export async function reconcilePendingSwap(runtime: Runtime, state: AgentState, 
 export async function refreshBootstrapBaseline(runtime: Runtime, state: AgentState): Promise<void> {
   if (!state.bootstrapBaselinePending) return;
   const {config, provider, walletAddress} = runtime;
+  const block = await provider.getBlock("latest");
+  if (!block || !block.hash) throw new Error("Bootstrap baseline block is unavailable");
+  const overrides = {blockTag: block.number};
   const [balance0, balance1, slot] = await Promise.all([
-    new Contract(config.token0, ERC20_ABI, provider).balanceOf(walletAddress) as Promise<bigint>,
-    new Contract(config.token1, ERC20_ABI, provider).balanceOf(walletAddress) as Promise<bigint>,
-    new Contract(config.pool, POOL_ABI, provider).slot0(),
+    new Contract(config.token0, ERC20_ABI, provider).balanceOf(walletAddress, overrides) as Promise<bigint>,
+    new Contract(config.token1, ERC20_ABI, provider).balanceOf(walletAddress, overrides) as Promise<bigint>,
+    new Contract(config.pool, POOL_ABI, provider).slot0(overrides),
   ]);
   const value = balance0 * priceX18FromSqrtPrice(BigInt(slot[0])) / ONE + balance1;
   state.dailyStartValueQuote = value > 0n ? value.toString() : null;

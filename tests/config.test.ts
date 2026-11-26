@@ -3,7 +3,7 @@ import test from "node:test";
 import { loadConfig } from "../src/config.js";
 import { ONE } from "../src/strategy.js";
 
-const ENV_NAMES = ["HSK_MIN_GAS_MULTIPLE", "HSK_ESTIMATED_GAS_HSK", "HSK_POOL_FEE"];
+const ENV_NAMES = ["HSK_MIN_GAS_MULTIPLE", "HSK_ESTIMATED_GAS_HSK", "HSK_POOL_FEE", "HSK_ESTIMATED_APPROVAL_GAS_HSK", "HSK_ESTIMATED_REGISTRY_GAS_HSK", "HSK_MIN_TRADABLE_NOTIONAL_QUOTE"];
 
 function withEnv(values: Record<string, string>, run: () => void): void {
   const previous = ENV_NAMES.map((name) => process.env[name]);
@@ -53,4 +53,30 @@ test("gas_floor configuration rejects invalid multiples and gas estimates", () =
 
 test("pool fee configuration excludes a 100 percent fee", () => {
   withEnv({HSK_POOL_FEE: "1000000"}, () => assert.throws(loadConfig, /HSK_POOL_FEE/));
+});
+
+test("whole-path estimates and the initial dust threshold have independent defaults and overrides", () => {
+  withEnv({}, () => {
+    const config = loadConfig();
+    assert.equal(config.estimatedApprovalGasHsk, 46321n * 10n ** 9n);
+    assert.equal(config.estimatedRegistryGasHsk, 35773n * 10n ** 9n);
+    assert.equal(config.minTradableNotionalQuote, ONE / 100n);
+  });
+  withEnv({HSK_ESTIMATED_APPROVAL_GAS_HSK: "0.00005", HSK_ESTIMATED_REGISTRY_GAS_HSK: "0.00004", HSK_MIN_TRADABLE_NOTIONAL_QUOTE: "2"}, () => {
+    const config = loadConfig();
+    assert.equal(config.estimatedApprovalGasHsk, 5n * 10n ** 13n);
+    assert.equal(config.estimatedRegistryGasHsk, 4n * 10n ** 13n);
+    assert.equal(config.minTradableNotionalQuote, 2n * ONE);
+  });
+});
+
+test("whole-path gas estimates and dust threshold reject zero, negatives and excess precision", () => {
+  for (const name of ["HSK_ESTIMATED_APPROVAL_GAS_HSK", "HSK_ESTIMATED_REGISTRY_GAS_HSK", "HSK_MIN_TRADABLE_NOTIONAL_QUOTE"]) {
+    for (const value of ["0", "-1", "0.0000000000000000001", "NaN"]) {
+      withEnv({[name]: value}, () => assert.throws(loadConfig, new RegExp(name)));
+    }
+  }
+  for (const name of ["HSK_ESTIMATED_APPROVAL_GAS_HSK", "HSK_ESTIMATED_REGISTRY_GAS_HSK"]) {
+    withEnv({[name]: "1.000000000000000001"}, () => assert.throws(loadConfig, new RegExp(name)));
+  }
 });
