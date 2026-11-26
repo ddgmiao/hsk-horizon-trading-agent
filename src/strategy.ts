@@ -1,5 +1,6 @@
 export const Q96 = 2n ** 96n;
 export const ONE = 10n ** 18n;
+export const FEE_DENOMINATOR = 1000000n;
 // Absolute ceiling for the slippage_cap risk check, independent of the
 // configured per-trade slippage so the check compares two distinct sources.
 export const ABSOLUTE_MAX_SLIPPAGE_BPS = 1000;
@@ -13,6 +14,7 @@ export interface RebalanceInput {
 }
 
 export interface StrategyConfig {
+  poolFee: number;
   targetToken1Bps: number;
   rebalanceBandBps: number;
   maxTradeInput: bigint;
@@ -42,6 +44,13 @@ export interface RiskInput {
   portfolioValueQuote: bigint;
   dailyStartValueQuote: bigint | null;
   maxDailyLossBps: number;
+  // Supplied only for rebalance plans; bootstrap keeps its existing guards.
+  gasFloor?: {
+    price1Per0X18: bigint;
+    token1PerWhskX18: bigint;
+    estimatedGasHsk: bigint;
+    minGasMultiple: number;
+  };
 }
 
 export interface RiskCheck {
@@ -57,6 +66,11 @@ export function priceX18FromSqrtPrice(sqrtPriceX96: bigint): bigint {
 
 export function planRebalance(input: RebalanceInput, config: StrategyConfig): Plan {
   if (input.price1Per0X18 <= 0n) throw new Error("price must be positive");
+  if (!Number.isSafeInteger(config.poolFee) || config.poolFee < 0 || BigInt(config.poolFee) >= FEE_DENOMINATOR) {
+    throw new Error("pool fee must be an integer from zero to below the fee denominator");
+  }
+  const fee = BigInt(config.poolFee);
+  const target = BigInt(config.targetToken1Bps);
   const token0ValueQuote = (input.balance0 * input.price1Per0X18) / ONE;
   const totalValueQuote = token0ValueQuote + input.balance1;
   const currentToken1WeightBps = totalValueQuote === 0n
@@ -74,8 +88,14 @@ export function planRebalance(input: RebalanceInput, config: StrategyConfig): Pl
   }
 
   if (deviationBps < 0) {
-    const gapQuote = targetToken1ValueQuote - input.balance1;
-    const wantedInput0 = (gapQuote * ONE) / input.price1Per0X18;
+    // Let T be total TT1 value, b the TT1 balance, t the target fraction,
+    // f the pool fee and x the input's TT1 value. Buying yields (1-f)*x
+    // and total value T-f*x. Solve (b+(1-f)*x)/(T-f*x)=t:
+    // x=(t*T-b)/(1-(1-t)*f), then input0=x/price. Keep the ratio
+    // unrounded until the final division into token base units.
+    const gapScaled = totalValueQuote * target - input.balance1 * 10000n;
+    const denominator = 10000n * FEE_DENOMINATOR - (10000n - target) * fee;
+    const wantedInput0 = (gapScaled * FEE_DENOMINATOR * ONE) / (denominator * input.price1Per0X18);
     const amountIn = minBigInt(wantedInput0, input.balance0, config.maxTradeInput);
     if (amountIn === 0n) {
       return holdPlan(totalValueQuote, targetToken1ValueQuote, currentToken1WeightBps, deviationBps, "Underweight token1, but token0 inventory is below the minimum trade amount.");
@@ -92,8 +112,13 @@ export function planRebalance(input: RebalanceInput, config: StrategyConfig): Pl
     };
   }
 
-  const gapToken1 = input.balance1 - targetToken1ValueQuote;
-  const amountIn = minBigInt(gapToken1, input.balance1, config.maxTradeInput);
+  // Selling x TT1 leaves b-x TT1 and total value T-f*x. Solve
+  // (b-x)/(T-f*x)=t: x=(b-t*T)/(1-t*f). This differs from the buy
+  // denominator for targets other than 50%; simply dividing by (1-f)
+  // ignores the fee's reduction of the portfolio's total value.
+  const gapScaled = input.balance1 * 10000n - totalValueQuote * target;
+  const wantedInput1 = (gapScaled * FEE_DENOMINATOR) / (10000n * FEE_DENOMINATOR - target * fee);
+  const amountIn = minBigInt(wantedInput1, input.balance1, config.maxTradeInput);
   if (amountIn === 0n) {
     return holdPlan(totalValueQuote, targetToken1ValueQuote, currentToken1WeightBps, deviationBps, "Overweight token1, but token1 inventory is below the minimum trade amount.");
   }
@@ -120,13 +145,28 @@ export function evaluateRisk(input: RiskInput): RiskCheck[] {
     || input.portfolioValueQuote * 10000n
       > input.dailyStartValueQuote * BigInt(10000 - input.maxDailyLossBps);
 
-  return [
+  const checks: RiskCheck[] = [
     {name: "max_trade_size", passed: !activeTrade || input.plan.amountIn <= input.maxTradeInput, detail: `input=${input.plan.amountIn}; cap=${input.maxTradeInput}`},
     {name: "max_position_size", passed: !activeTrade || positionCheckPassed, detail: `target_token1_value=${input.plan.targetToken1ValueQuote}; cap=${input.maxPositionQuote}`},
     {name: "slippage_cap", passed: input.configuredSlippageBps <= input.maxSlippageBps, detail: `configured=${input.configuredSlippageBps} bps; absolute_cap=${input.maxSlippageBps} bps`},
     {name: "min_trade_interval", passed: !activeTrade || intervalCheckPassed, detail: `last_trade_ms=${input.lastTradeAtMs ?? "none"}; interval_ms=${input.minTradeIntervalMs}`},
     {name: "daily_loss_halt", passed: lossCheckPassed, detail: `current_value=${input.portfolioValueQuote}; day_start_value=${input.dailyStartValueQuote ?? "unset"}; limit=${input.maxDailyLossBps} bps`},
   ];
+  if (input.gasFloor) {
+    const {price1Per0X18, token1PerWhskX18, estimatedGasHsk, minGasMultiple} = input.gasFloor;
+    const inputValueQuote = input.plan.tokenInIndex === 0
+      ? input.plan.amountIn * price1Per0X18 / ONE
+      : input.plan.amountIn;
+    // HSK and WHSK are 1:1; the conversion uses the live bootstrap slot0.
+    const gasCostQuote = estimatedGasHsk * token1PerWhskX18 / ONE;
+    const minimumValueQuote = gasCostQuote * BigInt(minGasMultiple);
+    checks.push({
+      name: "gas_floor",
+      passed: !activeTrade || inputValueQuote >= minimumValueQuote,
+      detail: `input_value_quote=${inputValueQuote}; estimated_gas_cost_quote=${gasCostQuote}; min_gas_multiple=${minGasMultiple}; minimum_value_quote=${minimumValueQuote}`,
+    });
+  }
+  return checks;
 }
 
 function holdPlan(totalValueQuote: bigint, targetToken1ValueQuote: bigint, currentToken1WeightBps: number, deviationBps: number, reason: string): Plan {

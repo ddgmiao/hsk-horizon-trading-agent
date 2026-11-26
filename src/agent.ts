@@ -11,6 +11,8 @@ type Snapshot = {
   blockNumber: number;
   sqrtPriceX96: bigint;
   price1Per0X18: bigint;
+  bootstrapSqrtPriceX96: bigint;
+  token1PerWhskX18: bigint;
   liquidity: bigint;
   balance0: bigint;
   balance1: bigint;
@@ -39,6 +41,9 @@ export async function preflight(): Promise<Record<string, unknown>> {
   const runtime = await createRuntime(config);
   const setup = await verifySetup(runtime);
   const snapshot = await readSnapshot(runtime);
+  const state = await loadState(config.statePath);
+  const plan = planRebalance(snapshot, config);
+  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now()));
   const quoteAmount = parseUnits("0.01", 18);
   const quoteOut = await quoteExactInput(runtime, config.token0, config.token1, quoteAmount, config.poolFee);
   const bootstrapQuote = await quoteExactInput(runtime, config.whsk, config.bootstrapToken, quoteAmount, config.poolFee);
@@ -82,6 +87,14 @@ export async function preflight(): Promise<Record<string, unknown>> {
       whskIn: formatUnits(quoteAmount, 18),
       token1OutFromWhsk: formatUnits(bootstrapQuote, 18),
     },
+    gasFloor: {
+      token1PerWhsk: formatUnits(snapshot.token1PerWhskX18, 18),
+      bootstrapSqrtPriceX96: snapshot.bootstrapSqrtPriceX96.toString(),
+      estimatedGasHsk: formatUnits(config.estimatedGasHsk, 18),
+      estimatedGasCostToken1: formatUnits(config.estimatedGasHsk * snapshot.token1PerWhskX18 / ONE, 18),
+      minGasMultiple: config.minGasMultiple,
+    },
+    rebalance: {action: plan.action, amountIn: formatUnits(plan.amountIn, 18), constraints: riskChecks},
     balances: {
       hsk: formatUnits(native, 18),
       whsk: formatUnits(whskBalance, 18),
@@ -103,7 +116,7 @@ export async function observe(): Promise<Record<string, unknown>> {
     await saveState(config.statePath, state);
   }
   const plan = planRebalance({balance0: snapshot.balance0, balance1: snapshot.balance1, price1Per0X18: snapshot.price1Per0X18}, config);
-  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot.valueQuote, Date.now()));
+  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now()));
   const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, {
     status: "observed",
     swapTxHash: null,
@@ -253,7 +266,7 @@ async function runCycle(runtime: Runtime, bootstrapPool: string): Promise<void> 
   await saveState(config.statePath, state);
 
   const plan = planRebalance({balance0: snapshot.balance0, balance1: snapshot.balance1, price1Per0X18: snapshot.price1Per0X18}, config);
-  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot.valueQuote, Date.now()));
+  const riskChecks = evaluateRisk(makeRiskInput(config, state, plan, snapshot, Date.now()));
   if (plan.action === "HOLD" || riskChecks.some((check) => !check.passed)) {
     const status = plan.action === "HOLD" ? "no_trade" : "risk_blocked";
     const record = makeDecisionRecord(runtime, snapshot, plan, riskChecks, {
@@ -348,6 +361,7 @@ async function bootstrap(runtime: Runtime, poolAddress: string, snapshot: Snapsh
     portfolioValueQuote: 0n,
     dailyStartValueQuote: null,
     maxDailyLossBps: config.maxDailyLossBps,
+    // gas_floor applies only to rebalancing; bootstrap must seed inventory.
   });
   if (riskChecks.some((check) => !check.passed)) {
     return recordBootstrapHold(runtime, snapshot, state, "A bootstrap risk constraint failed.", riskChecks);
@@ -561,25 +575,45 @@ async function verifySetup(runtime: Runtime): Promise<{bootstrapPool: string}> {
 
   const bootstrapPool = await factory.getPool(config.whsk, config.bootstrapToken, config.poolFee) as string;
   if (getAddress(bootstrapPool) !== getAddress(config.bootstrapPool)) throw new Error("Configured WHSK/TT1 pool does not match factory getPool");
-  const bootstrapLiquidity = BigInt(await new Contract(bootstrapPool, POOL_ABI, provider).liquidity());
-  if (bootstrapLiquidity === 0n) throw new Error("WHSK/TT1 pool has zero active liquidity");
+  const bootstrap = new Contract(bootstrapPool, POOL_ABI, provider);
+  const [bootstrapToken0, bootstrapToken1, bootstrapFee, bootstrapLiquidity] = await Promise.all([
+    bootstrap.token0() as Promise<string>, bootstrap.token1() as Promise<string>,
+    bootstrap.fee() as Promise<bigint>, bootstrap.liquidity() as Promise<bigint>,
+  ]);
+  const bootstrapTokens = [getAddress(bootstrapToken0), getAddress(bootstrapToken1)];
+  if (!bootstrapTokens.includes(getAddress(config.whsk)) || !bootstrapTokens.includes(getAddress(config.bootstrapToken))) {
+    throw new Error("Bootstrap pool token pair does not match WHSK/TT1");
+  }
+  if (Number(bootstrapFee) !== config.poolFee || BigInt(bootstrapLiquidity) === 0n) {
+    throw new Error("WHSK/TT1 pool has the wrong fee or zero active liquidity");
+  }
   return {bootstrapPool};
 }
 
 async function readSnapshot(runtime: Runtime): Promise<Snapshot> {
   const {config, provider, walletAddress} = runtime;
   const pool = new Contract(config.pool, POOL_ABI, provider);
-  const [slot0, liquidity, balance0, balance1, blockNumber] = await Promise.all([
+  const bootstrapPool = new Contract(config.bootstrapPool, POOL_ABI, provider);
+  const [slot0, liquidity, balance0, balance1, blockNumber, bootstrapSlot0, bootstrapToken0] = await Promise.all([
     pool.slot0(),
     pool.liquidity() as Promise<bigint>,
     new Contract(config.token0, ERC20_ABI, provider).balanceOf(walletAddress) as Promise<bigint>,
     new Contract(config.token1, ERC20_ABI, provider).balanceOf(walletAddress) as Promise<bigint>,
     provider.getBlockNumber(),
+    bootstrapPool.slot0(),
+    bootstrapPool.token0() as Promise<string>,
   ]);
   const sqrtPriceX96 = BigInt(slot0[0]);
   const price1Per0X18 = priceX18FromSqrtPrice(sqrtPriceX96);
+  const bootstrapSqrtPriceX96 = BigInt(bootstrapSlot0[0]);
+  const bootstrapPriceX18 = priceX18FromSqrtPrice(bootstrapSqrtPriceX96);
+  if (bootstrapPriceX18 <= 0n) throw new Error("Bootstrap pool price must be positive");
+  // slot0 is token1/token0; invert if WHSK is the pool's token1.
+  const token1PerWhskX18 = getAddress(bootstrapToken0) === getAddress(config.whsk)
+    ? bootstrapPriceX18 : ONE * ONE / bootstrapPriceX18;
+  if (token1PerWhskX18 <= 0n) throw new Error("TT1/WHSK price must be positive");
   const valueQuote = (BigInt(balance0) * price1Per0X18) / ONE + BigInt(balance1);
-  return {blockNumber, sqrtPriceX96, price1Per0X18, liquidity: BigInt(liquidity), balance0: BigInt(balance0), balance1: BigInt(balance1), valueQuote};
+  return {blockNumber, sqrtPriceX96, price1Per0X18, bootstrapSqrtPriceX96, token1PerWhskX18, liquidity: BigInt(liquidity), balance0: BigInt(balance0), balance1: BigInt(balance1), valueQuote};
 }
 
 async function quoteExactInput(runtime: Runtime, tokenIn: string, tokenOut: string, amountIn: bigint, fee: number): Promise<bigint> {
@@ -595,7 +629,7 @@ async function requireDecisionLog(runtime: Runtime): Promise<string> {
   return address;
 }
 
-function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, portfolioValueQuote: bigint, nowMs: number) {
+function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, snapshot: Snapshot, nowMs: number) {
   return {
     plan,
     maxTradeInput: config.maxTradeInput,
@@ -605,9 +639,15 @@ function makeRiskInput(config: AgentConfig, state: AgentState, plan: Plan, portf
     nowMs,
     lastTradeAtMs: state.lastTradeAtMs,
     minTradeIntervalMs: config.minTradeIntervalMs,
-    portfolioValueQuote,
+    portfolioValueQuote: snapshot.valueQuote,
     dailyStartValueQuote: state.dailyStartValueQuote === null ? null : BigInt(state.dailyStartValueQuote),
     maxDailyLossBps: config.maxDailyLossBps,
+    gasFloor: {
+      price1Per0X18: snapshot.price1Per0X18,
+      token1PerWhskX18: snapshot.token1PerWhskX18,
+      estimatedGasHsk: config.estimatedGasHsk,
+      minGasMultiple: config.minGasMultiple,
+    },
   };
 }
 
@@ -618,7 +658,10 @@ function makeDecisionRecord(runtime: Runtime, snapshot: Snapshot, plan: Plan, ri
     chainId: 133,
     wallet: runtime.walletAddress,
     addresses: {factory: runtime.config.factory, router: runtime.config.router, quoter: runtime.config.quoter, pool: runtime.config.pool, token0: runtime.config.token0, token1: runtime.config.token1},
-    prices: {token1PerToken0: formatUnits(snapshot.price1Per0X18, 18), sqrtPriceX96: snapshot.sqrtPriceX96.toString()},
+    prices: {
+      token1PerToken0: formatUnits(snapshot.price1Per0X18, 18), sqrtPriceX96: snapshot.sqrtPriceX96.toString(),
+      token1PerWhsk: formatUnits(snapshot.token1PerWhskX18, 18), bootstrapSqrtPriceX96: snapshot.bootstrapSqrtPriceX96.toString(),
+    },
     balances: {token0: formatUnits(snapshot.balance0, 18), token1: formatUnits(snapshot.balance1, 18), totalValueInToken1: formatUnits(snapshot.valueQuote, 18)},
     signals: {targetToken1Bps: runtime.config.targetToken1Bps, currentToken1WeightBps: plan.currentToken1WeightBps, deviationBps: plan.deviationBps},
     plan: {kind, action: plan.action, amountIn: formatUnits(plan.amountIn, 18), amountInRaw: plan.amountIn.toString(), reason: plan.reason},

@@ -1,12 +1,12 @@
 # Horizon 133
 
-Horizon 133 is a deterministic inventory-rebalancing agent for HashKey Chain Testnet. It reads a Uniswap V3 pool's `slot0`, computes a token allocation signal, applies position, trade-size, slippage, interval, and daily-loss guards, and sends swaps through the verified SwapRouter02 candidate. It records every observation and decision as JSON Lines and emits an on-chain decision event for each completed swap.
+Horizon 133 is a deterministic inventory-rebalancing agent for HashKey Chain Testnet. It reads Uniswap V3 `slot0` prices, computes a fee-aware token allocation signal, applies six guards (position, trade size, slippage, interval, daily loss, and gas floor), and sends swaps through the verified SwapRouter02 candidate. It records every observation and decision as JSON Lines and emits an on-chain decision event for each completed swap.
 
 The strategy uses only chain data and needs no paid API key or LLM. The decision engine is deliberately deterministic: every input is on-chain data, every guard is explicit, and every decision is reproducible from the JSONL ledger; the autonomy is in the unattended sense-decide-act loop, not in a hosted model. The agent trades directly from its EOA; the small `AgentDecisionLog` contract records completed swaps without custody. Direct routing keeps the test wallet's assets under the key holder's control and avoids a vault approval surface.
 
 ## Current status
 
-The implementation, offline tests, and live testnet session are complete. The full JSONL decision ledger is in `logs/decisions.jsonl`; the dashboard serves this same file at `/logs/decisions.jsonl`.
+The strategy enhancements are implemented and verified by 26 unit tests (including all 11 original tests), `tsc --noEmit`, and read-only `preflight`/`audit`. The verified live session below (17 ledger records and two swaps) ran the **strategy before these enhancements**. The enhanced strategy has **not executed a new live swap**. The full historical JSONL decision ledger is preserved in `logs/decisions.jsonl`; the dashboard serves this same file at `/logs/decisions.jsonl`.
 
 The agent uses a **0.02 HSK gas reserve**. Measured gas for the verified session was **0.000300 HSK** for the one-off contract deployment and **0.000036–0.000142 HSK** for each routine transaction (wrap, approvals, swaps, decision records), so the 0.1 HSK faucet drip still leaves operating funds after reserve. `AgentDecisionLog` is already deployed at `0xfb3e5F2d31A1a473CC09C847A4B564C0c2C46FD1` by transaction [`0x4fe2bd18ee9eb9c60f93b7fcc6fdcb28a5fb520816508206e3c92bc138283d85`](https://testnet-explorer.hskchain.net/tx/0x4fe2bd18ee9eb9c60f93b7fcc6fdcb28a5fb520816508206e3c92bc138283d85); do not redeploy it. The live session started with 0.099699775767 HSK and finished with 0.089204694061578573 HSK.
 
@@ -16,7 +16,7 @@ There is a second discovery limitation: the HSKSwap app origin returned a jurisd
 
 ```text
 HSK Chain Testnet (133)
-  slot0 + balances -> deterministic signal -> risk checks -> QuoterV2
+  main + bootstrap slot0 + balances -> fee-aware signal -> six risk checks -> QuoterV2
                                                    -> SwapRouter02
                                                    -> AgentDecisionLog event
                                                    -> logs/decisions.jsonl -> dashboard
@@ -29,6 +29,37 @@ HSK Chain Testnet (133)
 - `tests/strategy.test.ts` exercises the offline math and risk gates.
 
 The loop targets 50% TT1 by portfolio value, holds inside a 500 bps band, and caps each input at 0.1 token. It caps quote slippage at 100 bps, waits at least 300 seconds between trades, caps a TT1 position at 2 TT1, and halts at a 5% daily marked loss. A fresh wallet with no TT1/TT2 can bootstrap by wrapping 0.01 HSK to WHSK and swapping WHSK to TT1 through the on-chain pool. The next loop cycle can rebalance TT1 against TT2.
+
+## Strategy and six risk checks
+
+| Constraint | Rule / default |
+| --- | --- |
+| `max_trade_size` | Input at most 0.1 token, also limited by available inventory |
+| `max_position_size` | A buy's target TT1 position must not exceed 2 TT1 |
+| `slippage_cap` | Configured 100 bps; independent absolute ceiling 1,000 bps |
+| `min_trade_interval` | At least 300 seconds between trades |
+| `daily_loss_halt` | Halt at a marked daily loss of 500 bps (5%) |
+| `gas_floor` | Rebalance input value in TT1 must be at least `minGasMultiple × estimatedGasHsk × live TT1/WHSK price` |
+
+`gas_floor` compares the **capped planned input**, valued at the main pool's `slot0` for TT2 input or 1:1 for TT1 input. The gas estimate defaults to **0.00015 HSK**, above the measured maximum routine transaction cost of **0.000142 HSK**. HSK and WHSK are 1:1, and `readSnapshot` reads the configured WHSK/TT1 bootstrap pool's `slot0`, accounting for token order, to convert gas to TT1. No fixed WHSK price is used. `HSK_MIN_GAS_MULTIPLE` defaults to **2** (integer range 1–1,000); `HSK_ESTIMATED_GAS_HSK` accepts a positive decimal up to 1 HSK with at most 18 decimals. Equality passes; a value below the threshold yields `risk_blocked`. The `gas_floor` entry uses the same `name`/`detail`/`passed` format as the other ledger `constraints`, with input value, gas cost, multiple, and threshold in its detail. It passes for HOLD and is **not applied to bootstrap**.
+
+The design uses the measured example **0.000120 HSK ≈ 0.002070 TT1** per transaction. A multiple of 20 would impose a **0.041 TT1** threshold, exceeding the current portfolio's **0.008598 TT1** gap at the band edge and stretching the effective band from **500 bps to 2,407 bps**, essentially stopping rebalancing. A multiple of 2 gives **0.00414 TT1**, filtering meaningless orders below half the band. These are the measured design example; the conservative default estimate of 0.00015 HSK and runtime price determine the actual threshold.
+
+### Fee-aware planning
+
+The main pool fee is read from the configured `poolFee` (`HSK_POOL_FEE=3000`, i.e. 30 bps), with a shared denominator of 1,000,000. Let `T` be current total TT1 value, `b` the TT1 balance, `t` the target fraction, `f` the fee fraction, and `p` the TT1/TT2 price. Under a linear price with fees, buying with TT1 input value `x` leaves TT1 balance `b+(1-f)x` and total value `T-fx`; selling leaves `b-x` and `T-fx`. Solving for the target weight gives:
+
+- Buy TT1: `amountIn(TT2) = (tT-b) / [p × (1-(1-t)f)]`.
+- Sell TT1: `amountIn(TT1) = (b-tT) / (1-tf)`.
+
+At the 50% target both denominators include `1-f/2`. After final integer rounding, inventory and input caps still apply; an uncapped simulated fill returns to 5,000 bps under this model. The measured old linear estimate differed from execution by **33.5 bps ≈ 30 bps fee + 3.5 bps curvature**, leaving weight **5,006 bps**, a **6 bps** residual. Fee-aware planning removes the modeled fee residual; actual curvature and price movement still affect execution, which retains QuoterV2 and the minimum-output bound.
+
+## 考虑过但未采用的增强（附实测理由）
+
+- **池 TWAP**: The main pool has `observationCardinality=1`; `observe` averages across all six tested windows equal the current tick **-11055**. TWAP degenerates to spot. Expanding observation cardinality and accumulating history are prerequisites that have not been met, so this is deferred.
+- **滞回带**: The verified ledger settled at **5,006 bps** after execution, and the following **9 rounds** held at **6 bps** deviation. There are no band-edge oscillation samples, so the measured marginal value is zero. Reassess if oscillation samples appear.
+- **流动性份额上限**: **1%** of pool value is **4.89 TT1**, which would never trigger for this portfolio; the existing **0.1** input cap is just **2.05 bps** of pool value. This would be a decorative check and is omitted.
+- **双池交叉校验**: The fee-500 pool and main pool have a structural basis of **18,223 bps** (**0.9344 vs 0.3311**). Any usable threshold would permanently block operation, so this is omitted.
 
 ## Addresses
 
@@ -67,6 +98,8 @@ The first two transactions are discovery context only, not Horizon 133 entry tra
 
 On 2026-11-26 the agent completed a bootstrap cycle and 12 further autonomous cycles on chain ID 133. Both swaps, their approvals, the wrap, the deployment, and both DecisionLog transactions have successful receipts. Each DecisionLogged event references its matching swap hash.
 
+This session used the strategy before gas-floor and fee-aware planning enhancements. Its receipts and 17 ledger records are historical evidence for that version; enhanced behavior is covered by unit tests and read-only preflight/audit, with no new live swap.
+
 | Step | Result | On-chain transaction |
 | --- | --- | --- |
 | Wrap 0.01 HSK to WHSK | Success, block 36242450 | [`0x53df2e8c69503170e6f96fa1c3b158fb4629a75d72167e08bd2c7667306263cc`](https://testnet-explorer.hskchain.net/tx/0x53df2e8c69503170e6f96fa1c3b158fb4629a75d72167e08bd2c7667306263cc) |
@@ -97,13 +130,15 @@ npm run preflight
 npm run run
 ```
 
-`preflight` is read-only. This entry's deployed log address is in `.env.example`; `deploy` is only for a separate new registry and must not be run for this entry. `run` bootstraps and trades only after the wallet has enough HSK for the configured input and gas reserve. The run ledger remains in `logs/decisions.jsonl`.
+`preflight` is read-only and also reports the live bootstrap price, gas cost in TT1, and a rebalance preview with all six constraints, without appending ledger records or saving state. `npm run audit` is also read-only and inspects existing on-chain decision events. This entry's deployed log address is in `.env.example`; `deploy` is only for a separate new registry and must not be run for this entry. `run` bootstraps and trades only after the wallet has enough HSK for the configured input and gas reserve. The run ledger remains in `logs/decisions.jsonl`.
+
+Enhancement verification on 2026-11-26: `npm test` passed **26/26**, `npm run check` (`tsc --noEmit`) passed, and read-only `preflight`/`audit` passed at block **36250674**. Preflight balances matched the documented final balances exactly, all six preview constraints passed (HOLD), and audit returned the same two matching swap events. No trading loop or ledger-writing observation was run.
 
 Run the static dashboard at <http://127.0.0.1:4173> with `npm run dashboard`. Its `/logs/decisions.jsonl` endpoint serves the actual committed-and-live `logs/decisions.jsonl` file; the dashboard links swaps, approvals, and decision-log transactions to the testnet explorer.
 
 ## Reproduction values
 
-The exact defaults live in [.env.example](.env.example). Important values are chain ID `133`, factory `0x2dC2...`, router `0xa691...`, QuoterV2 `0x73820...`, TT2 `0x0284...`, TT1 `0xC383...`, pair fee `3000`, target weight `5000` bps, band `500` bps, max input `0.1`, max position `2` TT1, slippage `100` bps, minimum interval `300` seconds, daily loss limit `500` bps, bootstrap input `0.01` HSK, and gas reserve `0.02` HSK. The reserve is sized against the measured session fees above (0.000300 HSK one-off deployment; 0.000036–0.000142 HSK per routine transaction).
+The exact defaults live in [.env.example](.env.example). Important values are chain ID `133`, factory `0x2dC2...`, router `0xa691...`, QuoterV2 `0x73820...`, TT2 `0x0284...`, TT1 `0xC383...`, pair fee `3000`, target weight `5000` bps, band `500` bps, max input `0.1`, max position `2` TT1, slippage `100` bps, minimum interval `300` seconds, daily loss limit `500` bps, gas-floor multiple `2`, estimated gas `0.00015` HSK, bootstrap input `0.01` HSK, and gas reserve `0.02` HSK. The reserve is sized against the measured session fees above (0.000300 HSK one-off deployment; 0.000036–0.000142 HSK per routine transaction).
 
 ## Stage commits
 

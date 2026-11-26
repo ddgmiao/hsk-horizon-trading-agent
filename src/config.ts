@@ -1,4 +1,5 @@
 import { isAddress, parseUnits } from "ethers";
+import { FEE_DENOMINATOR, ONE } from "./strategy.js";
 
 const DEFAULTS = {
   rpcUrl: "https://testnet.hsk.xyz",
@@ -20,6 +21,9 @@ const DEFAULTS = {
   maxSlippageBps: 100,
   minTradeIntervalSeconds: 300,
   maxDailyLossBps: 500,
+  minGasMultiple: 2,
+  // Above the measured maximum routine transaction gas of 0.000142 HSK.
+  estimatedGasHsk: "0.00015",
   bootstrapHsk: "0.01",
   // Measured session gas: 0.000300 HSK for the one-off contract deployment and 0.000036-0.000142 HSK per routine transaction; 0.02 HSK still leaves trade budget after the 0.1 HSK drip.
   hskGasReserve: "0.02",
@@ -47,6 +51,8 @@ export interface AgentConfig {
   maxSlippageBps: number;
   minTradeIntervalMs: number;
   maxDailyLossBps: number;
+  minGasMultiple: number;
+  estimatedGasHsk: bigint;
   bootstrapHsk: bigint;
   hskGasReserve: bigint;
   pollSeconds: number;
@@ -88,7 +94,12 @@ export function loadConfig(): AgentConfig {
   const maxSlippageBps = intEnv("HSK_MAX_SLIPPAGE_BPS", DEFAULTS.maxSlippageBps, 1, 100);
   const targetToken1Bps = intEnv("HSK_TARGET_TOKEN1_BPS", DEFAULTS.targetToken1Bps, 1, 9999);
   const rebalanceBandBps = intEnv("HSK_REBALANCE_BAND_BPS", DEFAULTS.rebalanceBandBps, 0, 4999);
-  const poolFee = intEnv("HSK_POOL_FEE", DEFAULTS.poolFee, 1, 1000000);
+  const poolFee = intEnv("HSK_POOL_FEE", DEFAULTS.poolFee, 1, Number(FEE_DENOMINATOR) - 1);
+  const minGasMultiple = intEnv("HSK_MIN_GAS_MULTIPLE", DEFAULTS.minGasMultiple, 1, 1000);
+  const estimatedGasHsk = amountEnv("HSK_ESTIMATED_GAS_HSK", DEFAULTS.estimatedGasHsk);
+  if (estimatedGasHsk <= 0n || estimatedGasHsk > ONE) {
+    throw new Error("HSK_ESTIMATED_GAS_HSK must be greater than zero and at most 1 HSK");
+  }
 
   const maxTradeInput = amountEnv("HSK_MAX_TRADE_INPUT", DEFAULTS.maxTradeInput);
   const maxPositionQuote = amountEnv("HSK_MAX_POSITION_QUOTE", DEFAULTS.maxPositionQuote);
@@ -118,6 +129,8 @@ export function loadConfig(): AgentConfig {
     maxSlippageBps,
     minTradeIntervalMs: intEnv("HSK_MIN_TRADE_INTERVAL_SECONDS", DEFAULTS.minTradeIntervalSeconds, 0) * 1000,
     maxDailyLossBps: intEnv("HSK_MAX_DAILY_LOSS_BPS", DEFAULTS.maxDailyLossBps, 1, 10000),
+    minGasMultiple,
+    estimatedGasHsk,
     bootstrapHsk,
     hskGasReserve: amountEnv("HSK_HSK_GAS_RESERVE", DEFAULTS.hskGasReserve),
     pollSeconds: intEnv("HSK_POLL_SECONDS", DEFAULTS.pollSeconds, 1, 3600),
